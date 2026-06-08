@@ -73,7 +73,12 @@ def make_story_image(images: List[Path], prompt_text: str, out_path: Path, max_h
         # draw label centered above image
         w, h = im.size
         label_y = padding
-        txt_w, txt_h = draw.textsize(label, font=font)
+        try:
+            bbox = draw.textbbox((0, 0), label, font=font)
+            txt_w = bbox[2] - bbox[0]
+            txt_h = bbox[3] - bbox[1]
+        except Exception:
+            txt_w, txt_h = font.getsize(label)
         draw.text((x + (w - txt_w) / 2, label_y), label, fill=(0, 0, 0), font=font)
 
         # paste image
@@ -88,7 +93,12 @@ def make_story_image(images: List[Path], prompt_text: str, out_path: Path, max_h
     # try to fit font size larger if possible
     y = prompt_area_top
     for line in lines:
-        tw, th = draw.textsize(line, font=prompt_font)
+        try:
+            tb = draw.textbbox((0, 0), line, font=prompt_font)
+            tw = tb[2] - tb[0]
+            th = tb[3] - tb[1]
+        except Exception:
+            tw, th = prompt_font.getsize(line)
         draw.text(((total_width - tw) / 2, y), line, fill=(80, 0, 120), font=prompt_font)
         y += th + 6
 

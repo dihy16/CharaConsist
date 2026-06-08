@@ -119,6 +119,8 @@ def load_mix_prompt_file(pipe, file_path):
     return story_prompts, story_bg_lens, story_real_lens, story_meta_info
 
 from PIL import Image
+from make_story_image import parse_prompt_scenes, save_story_visualization
+
 def overlay_mask_on_image(image, mask, color, output_path):
     img_array = np.array(image).astype(np.float32) * 0.5
     mask_zero = np.zeros_like(img_array)
@@ -205,9 +207,12 @@ if __name__ == "__main__":
                     f"{mask_out_dir}/{ind}_mask.jpg",
                 )
         reset_id_bank(pipe)
+        mix_prompt_parts = [part for scene in parse_prompt_scenes(args.prompts_file) for part in scene]
+        save_story_visualization(args.out_dir, mix_prompt_parts)
     else:
         # Load prompts for standard batch mode
         all_prompt_info = load_prompt_file(pipe, args.prompts_file)
+        all_prompt_scenes = parse_prompt_scenes(args.prompts_file)
 
         for prompt_ind, (prompts, bg_lens, real_lens) in enumerate(all_prompt_info):
             out_dir = os.path.join(args.out_dir, f"prompt_{prompt_ind}")
@@ -244,3 +249,5 @@ if __name__ == "__main__":
                 if args.save_mask:
                     overlay_mask_on_image(images[0], spatial_kwargs["curr_fg_mask"][0].cpu().numpy(), (255, 0, 0), f"{mask_out_dir}/{ind}_mask.jpg")
             reset_id_bank(pipe)
+            if prompt_ind < len(all_prompt_scenes):
+                save_story_visualization(out_dir, all_prompt_scenes[prompt_ind])

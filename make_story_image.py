@@ -11,11 +11,39 @@ The output will be saved as `story.jpg` in the results folder by default.
 from __future__ import annotations
 
 import argparse
-import os
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
+
 from PIL import Image, ImageDraw, ImageFont
-import textwrap
+
+PromptPart = Tuple[str, str, str]
+
+
+def parse_prompt_scenes(file_path: str | Path) -> List[List[PromptPart]]:
+    """Parse bg#fg#act prompt files grouped by blank lines."""
+    scenes: List[List[PromptPart]] = []
+    current: List[PromptPart] = []
+    with open(file_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                parts = line.split("#", 2)
+                if len(parts) == 3:
+                    current.append(tuple(part.strip() for part in parts))
+            elif current:
+                scenes.append(current)
+                current = []
+    if current:
+        scenes.append(current)
+    return scenes
+
+
+def flatten_prompt_scenes(scenes: List[List[PromptPart]]) -> List[PromptPart]:
+    return [part for scene in scenes for part in scene]
+
+
+def frame_label(bg: str, act: str) -> str:
+    return f"{bg} ... {act}"
 
 
 def find_prompt_file(folder: Path) -> Optional[Path]:
@@ -26,108 +54,223 @@ def find_prompt_file(folder: Path) -> Optional[Path]:
 
 
 def search_prompt_anywhere(folder: Path) -> Optional[Path]:
-    # Try folder, parent, repo prompts folder, examples, then any txt nearby
     searches = [folder, folder.parent]
     repo_root = Path(__file__).resolve().parent
-    searches.append(repo_root / "prompts")
-    searches.append(repo_root / "examples")
-    for s in searches:
-        if s and s.exists():
-            # prefer files with 'prompt' in name
-            for p in s.glob("*prompt*.txt"):
-                return p
-            for p in s.glob("*.txt"):
-                return p
+    searches.extend([repo_root / "prompts", repo_root / "examples"])
+    for search_dir in searches:
+        if search_dir and search_dir.exists():
+            for pattern in ("*prompt*.txt", "*.txt"):
+                matches = list(search_dir.glob(pattern))
+                if matches:
+                    return matches[0]
     return None
+
+
+def _image_sort_key(path: Path):
+    stem = path.stem.lower()
+    if stem == "id":
+        return (0, 0)
+    if stem.isdigit():
+        return (1, int(stem))
+    return (2, stem)
 
 
 def list_finished_images(folder: Path) -> List[Path]:
     exts = (".png", ".jpg", ".jpeg", ".webp")
-    imgs = [p for p in folder.iterdir() if p.suffix.lower() in exts and p.is_file()]
-    # exclude preview/_pre images
-    imgs = [p for p in imgs if "_pre" not in p.stem and "-pre" not in p.stem]
-    imgs.sort()
+    imgs = [
+        path
+        for path in folder.iterdir()
+        if path.suffix.lower() in exts
+        and path.is_file()
+        and "_pre" not in path.stem
+        and path.stem.lower() != "story"
+    ]
+    imgs.sort(key=_image_sort_key)
     return imgs
 
 
-def make_story_image(images: List[Path], prompt_text: str, out_path: Path, max_height=512):
+def collect_result_images(folder: Path, num_prompts: int) -> List[Path]:
+    paths: List[Path] = []
+    id_path = folder / "id.jpg"
+    if id_path.exists():
+        paths.append(id_path)
+        for index in range(num_prompts - 1):
+            frame_path = folder / f"{index}.jpg"
+            if frame_path.exists():
+                paths.append(frame_path)
+    else:
+        for index in range(num_prompts):
+            frame_path = folder / f"{index}.jpg"
+            if frame_path.exists():
+                paths.append(frame_path)
+    return paths
+
+
+def load_font(size: int) -> ImageFont.ImageFont:
+    for name in (
+        "arial.ttf",
+        "Arial.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ):
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def _text_size(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> tuple[int, int]:
+    bbox = draw.textbbox((0, 0), text, font=font)
+    return bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+
+def wrap_text(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.ImageFont,
+    max_width: int,
+) -> List[str]:
+    words = text.split()
+    if not words:
+        return []
+
+    lines = [words[0]]
+    for word in words[1:]:
+        candidate = f"{lines[-1]} {word}"
+        if _text_size(draw, candidate, font)[0] <= max_width:
+            lines[-1] = candidate
+        else:
+            lines.append(word)
+    return lines
+
+
+def resize_square(image: Image.Image, size: int) -> Image.Image:
+    image = image.convert("RGB")
+    width, height = image.size
+    scale = size / max(width, height)
+    new_width = int(width * scale)
+    new_height = int(height * scale)
+    image = image.resize((new_width, new_height), Image.LANCZOS)
+    canvas = Image.new("RGB", (size, size), (255, 255, 255))
+    canvas.paste(image, ((size - new_width) // 2, (size - new_height) // 2))
+    return canvas
+
+
+def make_story_image(
+    images: List[Path],
+    frame_labels: List[str],
+    identity_prompt: str,
+    out_path: Path,
+    panel_size: int = 512,
+) -> None:
     if not images:
         raise ValueError("No finished images found to compose.")
+    if len(frame_labels) != len(images):
+        raise ValueError(
+            f"Expected {len(images)} frame labels, got {len(frame_labels)}."
+        )
 
-    thumbs = []
-    labels = []
-    for p in images:
-        img = Image.open(p).convert("RGB")
-        # scale to max_height while keeping aspect
-        w, h = img.size
-        if h != max_height:
-            new_w = int(w * (max_height / h))
-            img = img.resize((new_w, max_height), Image.LANCZOS)
-        thumbs.append(img)
-        labels.append(p.stem)
+    thumbs = [resize_square(Image.open(path), panel_size) for path in images]
 
-    padding = 16
-    label_height = 24
-    bottom_prompt_height = 160
+    top_margin = 12
+    bottom_margin = 24
+    gap_below_labels = 8
+    gap_above_identity = 20
+    label_font = load_font(13)
+    identity_font = load_font(20)
 
-    total_width = sum(im.width for im in thumbs) + padding * (len(thumbs) + 1)
-    canvas_height = label_height + max(im.height for im in thumbs) + bottom_prompt_height + padding * 2
+    measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    line_height = _text_size(measure, "Ay", label_font)[1]
 
-    canvas = Image.new("RGB", (total_width, canvas_height), color=(255, 255, 255))
+    wrapped_labels: List[List[str]] = []
+    max_label_lines = 0
+    for label in frame_labels:
+        lines = wrap_text(measure, label, label_font, panel_size - 8)
+        wrapped_labels.append(lines)
+        max_label_lines = max(max_label_lines, len(lines))
+
+    label_area_height = max_label_lines * line_height + max(0, max_label_lines - 1) * 2
+
+    if identity_prompt.startswith("Identity Prompt"):
+        identity_text = identity_prompt
+    else:
+        identity_text = f"Identity Prompt: {identity_prompt}"
+
+    total_width = panel_size * len(thumbs)
+    identity_lines = wrap_text(measure, identity_text, identity_font, total_width - 40)
+    identity_line_height = _text_size(measure, "Ay", identity_font)[1]
+    identity_area_height = (
+        len(identity_lines) * identity_line_height
+        + max(0, len(identity_lines) - 1) * 4
+    )
+
+    canvas_height = (
+        top_margin
+        + label_area_height
+        + gap_below_labels
+        + panel_size
+        + gap_above_identity
+        + identity_area_height
+        + bottom_margin
+    )
+
+    canvas = Image.new("RGB", (total_width, canvas_height), (255, 255, 255))
     draw = ImageDraw.Draw(canvas)
 
-    # font
-    try:
-        font = ImageFont.truetype("arial.ttf", 14)
-        prompt_font = ImageFont.truetype("arial.ttf", 20)
-    except Exception:
-        font = ImageFont.load_default()
-        prompt_font = font
+    label_color = (210, 85, 45)
+    identity_color = (90, 0, 130)
+    image_y = top_margin + label_area_height + gap_below_labels
 
-    x = padding
-    for im, label in zip(thumbs, labels):
-        # draw label centered above image
-        w, h = im.size
-        label_y = padding
-        try:
-            bbox = draw.textbbox((0, 0), label, font=font)
-            txt_w = bbox[2] - bbox[0]
-            txt_h = bbox[3] - bbox[1]
-        except Exception:
-            txt_w, txt_h = font.getsize(label)
-        draw.text((x + (w - txt_w) / 2, label_y), label, fill=(0, 0, 0), font=font)
+    for column, (thumb, lines) in enumerate(zip(thumbs, wrapped_labels)):
+        x = column * panel_size
+        label_y = top_margin
+        for line in lines:
+            draw.text((x + 4, label_y), line, fill=label_color, font=label_font)
+            label_y += line_height + 2
+        canvas.paste(thumb, (x, image_y))
 
-        # paste image
-        img_y = padding + label_height
-        canvas.paste(im, (x, img_y))
-        x += w + padding
+    identity_y = image_y + panel_size + gap_above_identity
+    for line in identity_lines:
+        text_width, _ = _text_size(draw, line, identity_font)
+        draw.text(
+            ((total_width - text_width) / 2, identity_y),
+            line,
+            fill=identity_color,
+            font=identity_font,
+        )
+        identity_y += identity_line_height + 4
 
-    # draw prompt text at bottom
-    prompt_area_top = padding + label_height + max(im.height for im in thumbs) + 20
-    prompt_area_width = total_width - padding * 2
-    # prepare multiline prompt text and draw it centered with a faint background
-    lines = textwrap.wrap(prompt_text, width=80)
-    prompt_block = "\n".join(lines) if lines else ""
-    try:
-        bbox = draw.multiline_textbbox((0, 0), prompt_block, font=prompt_font)
-        tw = bbox[2] - bbox[0]
-        th = bbox[3] - bbox[1]
-    except Exception:
-        # fallback sizing
-        tw = prompt_font.getsize(prompt_block)[0] if prompt_block else 0
-        line_h = prompt_font.getsize("A")[1]
-        th = line_h * max(1, len(lines)) + 6 * max(0, len(lines) - 1)
-
-    if prompt_block:
-        pad = 12
-        box_x = int((total_width - tw) / 2) - pad
-        box_y = int(prompt_area_top) - pad
-        box_w = int(tw) + pad * 2
-        box_h = int(th) + pad * 2
-        draw.rectangle([box_x, box_y, box_x + box_w, box_y + box_h], fill=(250, 250, 250))
-        draw.multiline_text(((total_width - tw) / 2, prompt_area_top), prompt_block, fill=(80, 0, 120), font=prompt_font, align="center")
-
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(out_path, quality=92)
+
+
+def save_story_visualization(
+    out_dir: str | Path,
+    prompt_parts: List[PromptPart],
+    out_path: Optional[Path] = None,
+) -> Optional[Path]:
+    if not prompt_parts:
+        return None
+
+    folder = Path(out_dir)
+    images = collect_result_images(folder, len(prompt_parts))
+    if not images:
+        images = list_finished_images(folder)
+    if not images:
+        print(f"No images found for story visualization in {folder}")
+        return None
+
+    count = min(len(images), len(prompt_parts))
+    images = images[:count]
+    prompt_parts = prompt_parts[:count]
+
+    labels = [frame_label(bg, act) for bg, _, act in prompt_parts]
+    identity = prompt_parts[0][1]
+    destination = out_path or (folder / "story.jpg")
+    make_story_image(images, labels, identity, destination)
+    print(f"Saved story visualization: {destination}")
+    return destination
 
 
 def main():
@@ -142,57 +285,23 @@ def main():
         print(f"Folder not found: {folder}")
         return
 
-    prompt_file = args.prompt_file
-    if prompt_file is None:
-        found = find_prompt_file(folder)
-        prompt_file = found
+    prompt_file = args.prompt_file or find_prompt_file(folder) or search_prompt_anywhere(folder)
+    if not prompt_file or not prompt_file.exists():
+        print("No prompt file provided or found in nearby locations.")
+        return
 
-    prompt_text = ""
-    used_prompt_file = None
-    if prompt_file and prompt_file.exists():
-        used_prompt_file = prompt_file
-    else:
-        cand = search_prompt_anywhere(folder)
-        if cand:
-            used_prompt_file = cand
-
-    if used_prompt_file:
-        try:
-            raw = used_prompt_file.read_text(encoding="utf-8").strip()
-            # If file contains multiple lines, try to find an 'Identity Prompt:' line
-            if "Identity Prompt" in raw:
-                for line in raw.splitlines():
-                    if "Identity Prompt" in line:
-                        # extract after ':' if present
-                        if ":" in line:
-                            prompt_text = line.split(":", 1)[1].strip()
-                        else:
-                            prompt_text = line.strip()
-                        break
-            else:
-                # use first non-empty line
-                for line in raw.splitlines():
-                    if line.strip():
-                        prompt_text = line.strip()
-                        break
-        except Exception:
-            prompt_text = ""
-    else:
-        print("No prompt file provided or found in nearby locations. Prompt text will be empty.")
-    if used_prompt_file:
-        print("Using prompt file:", used_prompt_file)
-
-    images = list_finished_images(folder)
-    if not images:
-        print("No finished images found in", folder)
+    print("Using prompt file:", prompt_file)
+    scenes = parse_prompt_scenes(prompt_file)
+    prompt_parts = flatten_prompt_scenes(scenes)
+    if not prompt_parts:
+        print("No valid bg#fg#act prompt lines found.")
         return
 
     out_path = args.output or (folder / "story.jpg")
     try:
-        make_story_image(images, prompt_text, out_path)
-        print("Saved:", out_path)
-    except Exception as e:
-        print("Failed to create story image:", e)
+        save_story_visualization(folder, prompt_parts, out_path)
+    except Exception as exc:
+        print("Failed to create story image:", exc)
 
 
 if __name__ == "__main__":

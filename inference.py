@@ -8,6 +8,7 @@ parser.add_argument("--out_dir", type=str, default="results")
 parser.add_argument("--use_interpolate", action='store_true')
 parser.add_argument("--share_bg", action='store_true')
 parser.add_argument("--save_mask", action='store_true')
+parser.add_argument("--mix_mode", action='store_true')
 parser.add_argument("--height", type=int, default=1024)
 parser.add_argument("--width", type=int, default=1024)
 parser.add_argument("--seed", type=int, default=2025)
@@ -102,6 +103,21 @@ def load_prompt_file(pipe, file_path):
         all_prompt_info.append((curr_prompts, curr_bg_len, curr_real_len))
     return all_prompt_info
 
+def load_mix_prompt_file(pipe, file_path):
+    scenes = load_prompt_file(pipe, file_path)
+    story_prompts, story_bg_lens, story_real_lens, story_meta_info = [], [], [], []
+    for scene_ind, (prompts, bg_lens, real_lens) in enumerate(scenes):
+        for prompt_ind, prompt in enumerate(prompts):
+            story_prompts.append(prompt)
+            story_bg_lens.append(bg_lens[prompt_ind])
+            story_real_lens.append(real_lens[prompt_ind])
+            story_meta_info.append(
+                dict(
+                    update_bg=(scene_ind > 0 and prompt_ind == 0),
+                )
+            )
+    return story_prompts, story_bg_lens, story_real_lens, story_meta_info
+
 from PIL import Image
 def overlay_mask_on_image(image, mask, color, output_path):
     img_array = np.array(image).astype(np.float32) * 0.5
@@ -125,8 +141,6 @@ if __name__ == "__main__":
     # Model Init
     pipe = MODEL_INIT_FUNCS[args.init_mode]()
     reset_attn_processor(pipe, size=(args.height//16, args.width//16))
-    # Load prompts
-    all_prompt_info = load_prompt_file(pipe, args.prompts_file)
     
     pipe_kwargs = dict(
         height = args.height,
@@ -135,38 +149,98 @@ if __name__ == "__main__":
         share_bg = args.share_bg
     )
 
-    for prompt_ind, (prompts, bg_lens, real_lens) in enumerate(all_prompt_info):
-        out_dir = os.path.join(args.out_dir, f"prompt_{prompt_ind}")
-        os.makedirs(out_dir, exist_ok=True)
+    if args.mix_mode:
+        prompts, bg_lens, real_lens, meta_info = load_mix_prompt_file(pipe, args.prompts_file)
+        if len(prompts) == 0:
+            raise ValueError("No prompts found in prompts_file.")
+
+        os.makedirs(args.out_dir, exist_ok=True)
         if args.save_mask:
-            mask_out_dir = os.path.join(args.out_dir, f"prompt_{prompt_ind}", "mask")
+            mask_out_dir = os.path.join(args.out_dir, "mask")
             os.makedirs(mask_out_dir, exist_ok=True)
+
         id_prompt = prompts[0]
         frm_prompts = prompts[1:]
 
-        # ID Gen
         print("#" * 50)
         print("Generating ID image ...")
         set_text_len(pipe, bg_lens[0], real_lens[0])
         id_images, id_spatial_kwargs = pipe(
-            id_prompt, is_id=True, generator = torch.Generator("cpu").manual_seed(args.seed), **pipe_kwargs)
+            id_prompt, is_id=True, generator=torch.Generator("cpu").manual_seed(args.seed), **pipe_kwargs
+        )
         id_fg_mask = id_spatial_kwargs["curr_fg_mask"]
-        id_images[0].save(f"{out_dir}/id.jpg")
+        id_images[0].save(f"{args.out_dir}/id.jpg")
         if args.save_mask:
-            overlay_mask_on_image(id_images[0], id_fg_mask[0].cpu().numpy(), (255, 0, 0), f"{mask_out_dir}/id_mask.jpg")
+            overlay_mask_on_image(
+                id_images[0], id_fg_mask[0].cpu().numpy(), (255, 0, 0), f"{mask_out_dir}/id_mask.jpg"
+            )
 
-        # Frame Gen
-        spatial_kwargs = dict(id_fg_mask = id_fg_mask, id_bg_mask = ~id_fg_mask)
+        spatial_kwargs = dict(id_fg_mask=id_fg_mask, id_bg_mask=~id_fg_mask)
         print("#" * 50)
         print("Generating frame images ...")
-        for ind, prompt in enumerate(frm_prompts):    
-            set_text_len(pipe, bg_lens[1:][ind], real_lens[1:][ind])
+        for ind, prompt in enumerate(frm_prompts):
+            curr_pipe_kwargs = dict(pipe_kwargs)
+            curr_pipe_kwargs.update(meta_info[ind + 1])
+            set_text_len(pipe, bg_lens[ind + 1], real_lens[ind + 1])
             pre_images, spatial_kwargs = pipe(
-                prompt, is_pre_run=True, generator = torch.Generator("cpu").manual_seed(args.seed), spatial_kwargs=spatial_kwargs, **pipe_kwargs) 
-            pre_images[0].save(f"{out_dir}/{ind}_pre.jpg")       
+                prompt,
+                is_pre_run=True,
+                generator=torch.Generator("cpu").manual_seed(args.seed),
+                spatial_kwargs=spatial_kwargs,
+                **curr_pipe_kwargs,
+            )
+            pre_images[0].save(f"{args.out_dir}/{ind}_pre.jpg")
             images, spatial_kwargs = pipe(
-                prompt, generator = torch.Generator("cpu").manual_seed(args.seed), spatial_kwargs=spatial_kwargs, **pipe_kwargs)
-            images[0].save(f"{out_dir}/{ind}.jpg")
+                prompt,
+                generator=torch.Generator("cpu").manual_seed(args.seed),
+                spatial_kwargs=spatial_kwargs,
+                **curr_pipe_kwargs,
+            )
+            images[0].save(f"{args.out_dir}/{ind}.jpg")
             if args.save_mask:
-                overlay_mask_on_image(images[0], spatial_kwargs["curr_fg_mask"][0].cpu().numpy(), (255, 0, 0), f"{mask_out_dir}/{ind}_mask.jpg")
+                overlay_mask_on_image(
+                    images[0],
+                    spatial_kwargs["curr_fg_mask"][0].cpu().numpy(),
+                    (255, 0, 0),
+                    f"{mask_out_dir}/{ind}_mask.jpg",
+                )
         reset_id_bank(pipe)
+    else:
+        # Load prompts for standard batch mode
+        all_prompt_info = load_prompt_file(pipe, args.prompts_file)
+
+        for prompt_ind, (prompts, bg_lens, real_lens) in enumerate(all_prompt_info):
+            out_dir = os.path.join(args.out_dir, f"prompt_{prompt_ind}")
+            os.makedirs(out_dir, exist_ok=True)
+            if args.save_mask:
+                mask_out_dir = os.path.join(args.out_dir, f"prompt_{prompt_ind}", "mask")
+                os.makedirs(mask_out_dir, exist_ok=True)
+            id_prompt = prompts[0]
+            frm_prompts = prompts[1:]
+
+            # ID Gen
+            print("#" * 50)
+            print("Generating ID image ...")
+            set_text_len(pipe, bg_lens[0], real_lens[0])
+            id_images, id_spatial_kwargs = pipe(
+                id_prompt, is_id=True, generator = torch.Generator("cpu").manual_seed(args.seed), **pipe_kwargs)
+            id_fg_mask = id_spatial_kwargs["curr_fg_mask"]
+            id_images[0].save(f"{out_dir}/id.jpg")
+            if args.save_mask:
+                overlay_mask_on_image(id_images[0], id_fg_mask[0].cpu().numpy(), (255, 0, 0), f"{mask_out_dir}/id_mask.jpg")
+
+            # Frame Gen
+            spatial_kwargs = dict(id_fg_mask = id_fg_mask, id_bg_mask = ~id_fg_mask)
+            print("#" * 50)
+            print("Generating frame images ...")
+            for ind, prompt in enumerate(frm_prompts):    
+                set_text_len(pipe, bg_lens[1:][ind], real_lens[1:][ind])
+                pre_images, spatial_kwargs = pipe(
+                    prompt, is_pre_run=True, generator = torch.Generator("cpu").manual_seed(args.seed), spatial_kwargs=spatial_kwargs, **pipe_kwargs) 
+                pre_images[0].save(f"{out_dir}/{ind}_pre.jpg")       
+                images, spatial_kwargs = pipe(
+                    prompt, generator = torch.Generator("cpu").manual_seed(args.seed), spatial_kwargs=spatial_kwargs, **pipe_kwargs)
+                images[0].save(f"{out_dir}/{ind}.jpg")
+                if args.save_mask:
+                    overlay_mask_on_image(images[0], spatial_kwargs["curr_fg_mask"][0].cpu().numpy(), (255, 0, 0), f"{mask_out_dir}/{ind}_mask.jpg")
+            reset_id_bank(pipe)

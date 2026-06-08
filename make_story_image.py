@@ -42,8 +42,14 @@ def flatten_prompt_scenes(scenes: List[List[PromptPart]]) -> List[PromptPart]:
     return [part for scene in scenes for part in scene]
 
 
-def frame_label(bg: str, act: str) -> str:
-    return f"{bg} ... {act}"
+def format_prompt_caption(bg: str, fg: str, act: str) -> str:
+    """Format bg, fg, and act into a single readable caption."""
+    bg = bg.rstrip(" ,").strip()
+    fg = fg.rstrip(" ,").strip()
+    act = act.lstrip("#").strip()
+    if fg and fg[0].islower():
+        fg = fg[0].upper() + fg[1:]
+    return f"{bg}. {fg}. #{act}"
 
 
 def find_prompt_file(folder: Path) -> Optional[Path]:
@@ -159,50 +165,32 @@ def resize_square(image: Image.Image, size: int) -> Image.Image:
 
 def make_story_image(
     images: List[Path],
-    frame_labels: List[str],
-    identity_prompt: str,
+    caption_text: str,
     out_path: Path,
     panel_size: int = 512,
 ) -> None:
     if not images:
         raise ValueError("No finished images found to compose.")
-    if len(frame_labels) != len(images):
-        raise ValueError(
-            f"Expected {len(images)} frame labels, got {len(frame_labels)}."
-        )
 
     thumbs = [resize_square(Image.open(path), panel_size) for path in images]
 
     top_margin = 12
     bottom_margin = 24
     gap_below_labels = 8
-    gap_above_identity = 20
-    label_font = load_font(13)
-    identity_font = load_font(20)
+    gap_above_caption = 20
+    label_font = load_font(14)
+    caption_font = load_font(20)
 
     measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))
-    line_height = _text_size(measure, "Ay", label_font)[1]
-
-    wrapped_labels: List[List[str]] = []
-    max_label_lines = 0
-    for label in frame_labels:
-        lines = wrap_text(measure, label, label_font, panel_size - 8)
-        wrapped_labels.append(lines)
-        max_label_lines = max(max_label_lines, len(lines))
-
-    label_area_height = max_label_lines * line_height + max(0, max_label_lines - 1) * 2
-
-    if identity_prompt.startswith("Identity Prompt"):
-        identity_text = identity_prompt
-    else:
-        identity_text = f"Identity Prompt: {identity_prompt}"
+    label_line_height = _text_size(measure, "Ay", label_font)[1]
+    label_area_height = label_line_height
 
     total_width = panel_size * len(thumbs)
-    identity_lines = wrap_text(measure, identity_text, identity_font, total_width - 40)
-    identity_line_height = _text_size(measure, "Ay", identity_font)[1]
-    identity_area_height = (
-        len(identity_lines) * identity_line_height
-        + max(0, len(identity_lines) - 1) * 4
+    caption_lines = wrap_text(measure, caption_text, caption_font, total_width - 40)
+    caption_line_height = _text_size(measure, "Ay", caption_font)[1]
+    caption_area_height = (
+        len(caption_lines) * caption_line_height
+        + max(0, len(caption_lines) - 1) * 4
     )
 
     canvas_height = (
@@ -210,36 +198,40 @@ def make_story_image(
         + label_area_height
         + gap_below_labels
         + panel_size
-        + gap_above_identity
-        + identity_area_height
+        + gap_above_caption
+        + caption_area_height
         + bottom_margin
     )
 
     canvas = Image.new("RGB", (total_width, canvas_height), (255, 255, 255))
     draw = ImageDraw.Draw(canvas)
 
-    label_color = (210, 85, 45)
-    identity_color = (90, 0, 130)
+    label_color = (0, 0, 0)
+    caption_color = (90, 0, 130)
     image_y = top_margin + label_area_height + gap_below_labels
 
-    for column, (thumb, lines) in enumerate(zip(thumbs, wrapped_labels)):
+    for column, thumb in enumerate(thumbs):
         x = column * panel_size
-        label_y = top_margin
-        for line in lines:
-            draw.text((x + 4, label_y), line, fill=label_color, font=label_font)
-            label_y += line_height + 2
+        label = str(column)
+        label_width, _ = _text_size(draw, label, label_font)
+        draw.text(
+            (x + (panel_size - label_width) / 2, top_margin),
+            label,
+            fill=label_color,
+            font=label_font,
+        )
         canvas.paste(thumb, (x, image_y))
 
-    identity_y = image_y + panel_size + gap_above_identity
-    for line in identity_lines:
-        text_width, _ = _text_size(draw, line, identity_font)
+    caption_y = image_y + panel_size + gap_above_caption
+    for line in caption_lines:
+        text_width, _ = _text_size(draw, line, caption_font)
         draw.text(
-            ((total_width - text_width) / 2, identity_y),
+            ((total_width - text_width) / 2, caption_y),
             line,
-            fill=identity_color,
-            font=identity_font,
+            fill=caption_color,
+            font=caption_font,
         )
-        identity_y += identity_line_height + 4
+        caption_y += caption_line_height + 4
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(out_path, quality=92)
@@ -265,10 +257,9 @@ def save_story_visualization(
     images = images[:count]
     prompt_parts = prompt_parts[:count]
 
-    labels = [frame_label(bg, act) for bg, _, act in prompt_parts]
-    identity = prompt_parts[0][1]
+    caption = format_prompt_caption(*prompt_parts[0])
     destination = out_path or (folder / "story.jpg")
-    make_story_image(images, labels, identity, destination)
+    make_story_image(images, caption, destination)
     print(f"Saved story visualization: {destination}")
     return destination
 

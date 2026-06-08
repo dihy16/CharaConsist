@@ -223,18 +223,18 @@ def make_story_image(
 
     thumbs = [resize_square(Image.open(path), panel_size) for path in images]
 
-    top_margin = 12
-    bottom_margin = 24
-    gap_below_context = 16
-    gap_below_index = 8
-    gap_below_panel = 10
-    gap_below_heading = 6
-    gap_between_context_parts = 10
+    top_margin = 16
+    bottom_margin = 28
+    gap_below_context = 20
+    gap_below_index = 10
+    gap_below_panel = 14
+    gap_below_heading = 8
+    gap_between_context_parts = 14
 
-    heading_font = load_font(12)
-    context_font = load_font(16)
-    index_font = load_font(14)
-    panel_font = load_font(11)
+    heading_font = load_font(18)
+    context_font = load_font(24)
+    index_font = load_font(20)
+    panel_font = load_font(18)
 
     measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))
     heading_line_height = _text_size(measure, "Ay", heading_font)[1]
@@ -259,13 +259,13 @@ def make_story_image(
     context_area_height = (
         heading_line_height
         + gap_below_heading
-        + _block_height(len(env_lines), context_line_height, 3)
+        + _block_height(len(env_lines), context_line_height, 5)
         + gap_between_context_parts
         + heading_line_height
         + gap_below_heading
-        + _block_height(len(char_lines), context_line_height, 3)
+        + _block_height(len(char_lines), context_line_height, 5)
     )
-    panel_caption_height = _block_height(max_panel_lines, panel_line_height, 2)
+    panel_caption_height = _block_height(max_panel_lines, panel_line_height, 4)
 
     canvas_height = (
         top_margin
@@ -299,7 +299,7 @@ def make_story_image(
     y += heading_line_height + gap_below_heading
     y = _draw_centered_lines(
         draw, env_lines, y, total_width, context_font, environment_color,
-        context_line_height, 3,
+        context_line_height, 5,
     )
     y += gap_between_context_parts
 
@@ -313,7 +313,7 @@ def make_story_image(
     y += heading_line_height + gap_below_heading
     y = _draw_centered_lines(
         draw, char_lines, y, total_width, context_font, character_color,
-        context_line_height, 3,
+        context_line_height, 5,
     )
 
     index_y = y + gap_below_context
@@ -341,7 +341,7 @@ def make_story_image(
                 fill=action_shot_color,
                 font=panel_font,
             )
-            text_y += panel_line_height + 2
+            text_y += panel_line_height + 4
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(out_path, quality=92)

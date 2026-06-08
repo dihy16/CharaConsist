@@ -105,18 +105,27 @@ def make_story_image(images: List[Path], prompt_text: str, out_path: Path, max_h
     # draw prompt text at bottom
     prompt_area_top = padding + label_height + max(im.height for im in thumbs) + 20
     prompt_area_width = total_width - padding * 2
+    # prepare multiline prompt text and draw it centered with a faint background
     lines = textwrap.wrap(prompt_text, width=80)
-    # try to fit font size larger if possible
-    y = prompt_area_top
-    for line in lines:
-        try:
-            tb = draw.textbbox((0, 0), line, font=prompt_font)
-            tw = tb[2] - tb[0]
-            th = tb[3] - tb[1]
-        except Exception:
-            tw, th = prompt_font.getsize(line)
-        draw.text(((total_width - tw) / 2, y), line, fill=(80, 0, 120), font=prompt_font)
-        y += th + 6
+    prompt_block = "\n".join(lines) if lines else ""
+    try:
+        bbox = draw.multiline_textbbox((0, 0), prompt_block, font=prompt_font)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+    except Exception:
+        # fallback sizing
+        tw = prompt_font.getsize(prompt_block)[0] if prompt_block else 0
+        line_h = prompt_font.getsize("A")[1]
+        th = line_h * max(1, len(lines)) + 6 * max(0, len(lines) - 1)
+
+    if prompt_block:
+        pad = 12
+        box_x = int((total_width - tw) / 2) - pad
+        box_y = int(prompt_area_top) - pad
+        box_w = int(tw) + pad * 2
+        box_h = int(th) + pad * 2
+        draw.rectangle([box_x, box_y, box_x + box_w, box_y + box_h], fill=(250, 250, 250))
+        draw.multiline_text(((total_width - tw) / 2, prompt_area_top), prompt_block, fill=(80, 0, 120), font=prompt_font, align="center")
 
     canvas.save(out_path, quality=92)
 

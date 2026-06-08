@@ -1,5 +1,9 @@
 """Generate a single story image from finished result images and a prompt file.
 
+Prompt files use bg#fg#act lines where:
+  - fg  -> [Character] part (identity / appearance)
+  - bg + act -> [Action / Environment] part (scene and action)
+
 Usage examples:
   python make_story_image.py --folder path/to/results --prompt-file path/to/prompt.txt
   python make_story_image.py --folder path/to/results
@@ -17,6 +21,9 @@ from typing import List, Optional, Tuple
 from PIL import Image, ImageDraw, ImageFont
 
 PromptPart = Tuple[str, str, str]
+
+CHARACTER_HEADING = "[Character]"
+ACTION_ENV_HEADING = "[Action / Environment]"
 
 
 def parse_prompt_scenes(file_path: str | Path) -> List[List[PromptPart]]:
@@ -42,14 +49,23 @@ def flatten_prompt_scenes(scenes: List[List[PromptPart]]) -> List[PromptPart]:
     return [part for scene in scenes for part in scene]
 
 
-def format_prompt_caption(bg: str, fg: str, act: str) -> str:
-    """Format bg, fg, and act into a single readable caption."""
-    bg = bg.rstrip(" ,").strip()
-    fg = fg.rstrip(" ,").strip()
-    act = act.lstrip("#").strip()
+def _clean_part(text: str) -> str:
+    return text.rstrip(" ,").strip()
+
+
+def format_character_part(fg: str) -> str:
+    fg = _clean_part(fg)
     if fg and fg[0].islower():
         fg = fg[0].upper() + fg[1:]
-    return f"{bg}. {fg}. #{act}"
+    return fg
+
+
+def format_action_env_part(bg: str, act: str) -> str:
+    bg = _clean_part(bg)
+    act = act.lstrip("#").strip()
+    if act:
+        return f"{bg}. {act}"
+    return bg
 
 
 def find_prompt_file(folder: Path) -> Optional[Path]:
@@ -151,6 +167,12 @@ def wrap_text(
     return lines
 
 
+def _block_height(num_lines: int, line_height: int, line_gap: int) -> int:
+    if num_lines <= 0:
+        return 0
+    return num_lines * line_height + (num_lines - 1) * line_gap
+
+
 def resize_square(image: Image.Image, size: int) -> Image.Image:
     image = image.convert("RGB")
     width, height = image.size
@@ -165,73 +187,137 @@ def resize_square(image: Image.Image, size: int) -> Image.Image:
 
 def make_story_image(
     images: List[Path],
-    caption_text: str,
+    character_text: str,
+    action_env_texts: List[str],
     out_path: Path,
     panel_size: int = 512,
 ) -> None:
     if not images:
         raise ValueError("No finished images found to compose.")
+    if len(action_env_texts) != len(images):
+        raise ValueError(
+            f"Expected {len(images)} action/environment captions, got {len(action_env_texts)}."
+        )
 
     thumbs = [resize_square(Image.open(path), panel_size) for path in images]
 
     top_margin = 12
     bottom_margin = 24
-    gap_below_labels = 8
-    gap_above_caption = 20
-    label_font = load_font(14)
-    caption_font = load_font(20)
+    gap_below_index = 8
+    gap_below_panel = 10
+    gap_above_character = 22
+    gap_below_heading = 6
+
+    index_font = load_font(14)
+    heading_font = load_font(12)
+    panel_font = load_font(11)
+    character_heading_font = load_font(13)
+    character_font = load_font(18)
 
     measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))
-    label_line_height = _text_size(measure, "Ay", label_font)[1]
-    label_area_height = label_line_height
+    index_line_height = _text_size(measure, "Ay", index_font)[1]
+    heading_line_height = _text_size(measure, "Ay", heading_font)[1]
+    panel_line_height = _text_size(measure, "Ay", panel_font)[1]
+    character_heading_line_height = _text_size(measure, "Ay", character_heading_font)[1]
+    character_line_height = _text_size(measure, "Ay", character_font)[1]
+
+    panel_text_width = panel_size - 12
+    wrapped_action_env: List[List[str]] = []
+    max_panel_lines = 0
+    for text in action_env_texts:
+        lines = wrap_text(measure, text, panel_font, panel_text_width)
+        wrapped_action_env.append(lines)
+        max_panel_lines = max(max_panel_lines, len(lines))
+
+    panel_caption_height = (
+        heading_line_height
+        + gap_below_heading
+        + _block_height(max_panel_lines, panel_line_height, 2)
+    )
 
     total_width = panel_size * len(thumbs)
-    caption_lines = wrap_text(measure, caption_text, caption_font, total_width - 40)
-    caption_line_height = _text_size(measure, "Ay", caption_font)[1]
-    caption_area_height = (
-        len(caption_lines) * caption_line_height
-        + max(0, len(caption_lines) - 1) * 4
+    character_body_lines = wrap_text(
+        measure, character_text, character_font, total_width - 48
+    )
+    character_area_height = (
+        character_heading_line_height
+        + gap_below_heading
+        + _block_height(len(character_body_lines), character_line_height, 4)
     )
 
     canvas_height = (
         top_margin
-        + label_area_height
-        + gap_below_labels
+        + index_line_height
+        + gap_below_index
         + panel_size
-        + gap_above_caption
-        + caption_area_height
+        + gap_below_panel
+        + panel_caption_height
+        + gap_above_character
+        + character_area_height
         + bottom_margin
     )
 
     canvas = Image.new("RGB", (total_width, canvas_height), (255, 255, 255))
     draw = ImageDraw.Draw(canvas)
 
-    label_color = (0, 0, 0)
-    caption_color = (90, 0, 130)
-    image_y = top_margin + label_area_height + gap_below_labels
+    index_color = (0, 0, 0)
+    heading_color = (70, 70, 70)
+    action_env_color = (30, 90, 150)
+    character_heading_color = (120, 40, 150)
+    character_color = (90, 0, 130)
+
+    image_y = top_margin + index_line_height + gap_below_index
+    panel_caption_y = image_y + panel_size + gap_below_panel
 
     for column, thumb in enumerate(thumbs):
         x = column * panel_size
         label = str(column)
-        label_width, _ = _text_size(draw, label, label_font)
+        label_width, _ = _text_size(draw, label, index_font)
         draw.text(
             (x + (panel_size - label_width) / 2, top_margin),
             label,
-            fill=label_color,
-            font=label_font,
+            fill=index_color,
+            font=index_font,
         )
         canvas.paste(thumb, (x, image_y))
 
-    caption_y = image_y + panel_size + gap_above_caption
-    for line in caption_lines:
-        text_width, _ = _text_size(draw, line, caption_font)
+        heading_width, _ = _text_size(draw, ACTION_ENV_HEADING, heading_font)
         draw.text(
-            ((total_width - text_width) / 2, caption_y),
-            line,
-            fill=caption_color,
-            font=caption_font,
+            (x + (panel_size - heading_width) / 2, panel_caption_y),
+            ACTION_ENV_HEADING,
+            fill=heading_color,
+            font=heading_font,
         )
-        caption_y += caption_line_height + 4
+
+        text_y = panel_caption_y + heading_line_height + gap_below_heading
+        for line in wrapped_action_env[column]:
+            line_width, _ = _text_size(draw, line, panel_font)
+            draw.text(
+                (x + (panel_size - line_width) / 2, text_y),
+                line,
+                fill=action_env_color,
+                font=panel_font,
+            )
+            text_y += panel_line_height + 2
+
+    character_y = panel_caption_y + panel_caption_height + gap_above_character
+    heading_width, _ = _text_size(draw, CHARACTER_HEADING, character_heading_font)
+    draw.text(
+        ((total_width - heading_width) / 2, character_y),
+        CHARACTER_HEADING,
+        fill=character_heading_color,
+        font=character_heading_font,
+    )
+    character_y += character_heading_line_height + gap_below_heading
+    for line in character_body_lines:
+        line_width, _ = _text_size(draw, line, character_font)
+        draw.text(
+            ((total_width - line_width) / 2, character_y),
+            line,
+            fill=character_color,
+            font=character_font,
+        )
+        character_y += character_line_height + 4
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(out_path, quality=92)
@@ -257,9 +343,12 @@ def save_story_visualization(
     images = images[:count]
     prompt_parts = prompt_parts[:count]
 
-    caption = format_prompt_caption(*prompt_parts[0])
+    character = format_character_part(prompt_parts[0][1])
+    action_env_texts = [
+        format_action_env_part(bg, act) for bg, _, act in prompt_parts
+    ]
     destination = out_path or (folder / "story.jpg")
-    make_story_image(images, caption, destination)
+    make_story_image(images, character, action_env_texts, destination)
     print(f"Saved story visualization: {destination}")
     return destination
 

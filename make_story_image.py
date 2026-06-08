@@ -25,6 +25,22 @@ def find_prompt_file(folder: Path) -> Optional[Path]:
     return candidates[0] if candidates else None
 
 
+def search_prompt_anywhere(folder: Path) -> Optional[Path]:
+    # Try folder, parent, repo prompts folder, examples, then any txt nearby
+    searches = [folder, folder.parent]
+    repo_root = Path(__file__).resolve().parent
+    searches.append(repo_root / "prompts")
+    searches.append(repo_root / "examples")
+    for s in searches:
+        if s and s.exists():
+            # prefer files with 'prompt' in name
+            for p in s.glob("*prompt*.txt"):
+                return p
+            for p in s.glob("*.txt"):
+                return p
+    return None
+
+
 def list_finished_images(folder: Path) -> List[Path]:
     exts = (".png", ".jpg", ".jpeg", ".webp")
     imgs = [p for p in folder.iterdir() if p.suffix.lower() in exts and p.is_file()]
@@ -123,11 +139,39 @@ def main():
         prompt_file = found
 
     prompt_text = ""
+    used_prompt_file = None
     if prompt_file and prompt_file.exists():
+        used_prompt_file = prompt_file
+    else:
+        cand = search_prompt_anywhere(folder)
+        if cand:
+            used_prompt_file = cand
+
+    if used_prompt_file:
         try:
-            prompt_text = prompt_file.read_text(encoding="utf-8").strip()
+            raw = used_prompt_file.read_text(encoding="utf-8").strip()
+            # If file contains multiple lines, try to find an 'Identity Prompt:' line
+            if "Identity Prompt" in raw:
+                for line in raw.splitlines():
+                    if "Identity Prompt" in line:
+                        # extract after ':' if present
+                        if ":" in line:
+                            prompt_text = line.split(":", 1)[1].strip()
+                        else:
+                            prompt_text = line.strip()
+                        break
+            else:
+                # use first non-empty line
+                for line in raw.splitlines():
+                    if line.strip():
+                        prompt_text = line.strip()
+                        break
         except Exception:
             prompt_text = ""
+    else:
+        print("No prompt file provided or found in nearby locations. Prompt text will be empty.")
+    if used_prompt_file:
+        print("Using prompt file:", used_prompt_file)
 
     images = list_finished_images(folder)
     if not images:

@@ -72,7 +72,8 @@ class CharaConsistPipeline(FluxPipeline):
         interpolate_end_step: int = 31,
         interpolate_weight: float = 0.8,
         sim_thr = 0.5,
-        save_mask_point_step: int = 10
+        save_mask_point_step: int = 10,
+        save_all_steps: bool = False
     ):
         
         height = height or self.default_sample_size * self.vae_scale_factor
@@ -168,32 +169,32 @@ class CharaConsistPipeline(FluxPipeline):
 
         def get_consist_kwargs(i):
             if is_id:
-                save_attn_weight = i == save_mask_point_step
+                save_attn_weight = save_all_steps or (i == save_mask_point_step)
                 save_attn_kv = (i < attn_end_step) and (i >= attn_start_step)
                 update_attn_kv = update_bg & (i < attn_end_step) and (i >= attn_start_step)
-                save_attn_out_for_sim = i == save_mask_point_step
+                save_attn_out_for_sim = save_all_steps or (i == save_mask_point_step)
                 save_attn_out_for_interpolate = use_interpolate and (i < interpolate_end_step) and (i >= interpolate_start_step)
                 save_cross_sim = False
                 fg_inter_img_attn = False
                 bg_inter_img_attn = False
                 attn_out_interpolate = False
             elif is_pre_run:
-                save_attn_weight = i <= save_mask_point_step
+                save_attn_weight = save_all_steps or (i <= save_mask_point_step)
                 save_attn_kv = False
                 update_attn_kv = False
                 save_attn_out_for_sim = False
                 save_attn_out_for_interpolate = False
-                save_cross_sim = i == save_mask_point_step
+                save_cross_sim = save_all_steps or (i == save_mask_point_step)
                 fg_inter_img_attn = False
                 bg_inter_img_attn = (i < attn_end_step) and (i >= attn_start_step) and share_bg and (not update_bg)
                 attn_out_interpolate = False
             else:
-                save_attn_weight = i <= save_mask_point_step
+                save_attn_weight = save_all_steps or (i <= save_mask_point_step)
                 save_attn_kv = False
                 update_attn_kv = update_bg & (i < attn_end_step) and (i >= attn_start_step)
                 save_attn_out_for_sim = False
                 save_attn_out_for_interpolate = False
-                save_cross_sim = i == save_mask_point_step
+                save_cross_sim = save_all_steps or (i == save_mask_point_step)
                 fg_inter_img_attn = (i < attn_end_step) and (i >= attn_start_step)
                 bg_inter_img_attn = (i < attn_end_step) and (i >= attn_start_step) and share_bg and (not update_bg)
                 attn_out_interpolate = use_interpolate & (i < interpolate_end_step) and (i >= interpolate_start_step)
@@ -236,6 +237,10 @@ class CharaConsistPipeline(FluxPipeline):
 
                 if self.joint_attention_kwargs["save_attn_weight"]:
                     curr_fg_mask = get_curr_fg_mask(self)
+                    if save_all_steps:
+                        if "all_fg_masks" not in spatial_kwargs:
+                            spatial_kwargs["all_fg_masks"] = dict()
+                        spatial_kwargs["all_fg_masks"][i] = curr_fg_mask.clone()
                     spatial_kwargs["curr_fg_mask"] = curr_fg_mask
                     if update_bg:
                         spatial_kwargs["id_bg_mask"] = copy.deepcopy(~curr_fg_mask)
@@ -243,18 +248,26 @@ class CharaConsistPipeline(FluxPipeline):
                 if self.joint_attention_kwargs["save_cross_sim"]:
                     avg_cross_sim = get_cross_sim(self)
                     max_sim, argmax_indices = torch.max(avg_cross_sim, dim=-1)
-                    id_fg_inds, curr_fg_inds = get_shared_fg_mask(
-                        spatial_kwargs["id_fg_mask"], 
-                        spatial_kwargs["curr_fg_mask"], 
-                        argmax_indices,
-                        max_sim>sim_thr
-                    )
-                    spatial_kwargs.update(
-                        id_fg_inds = id_fg_inds,
-                        curr_fg_inds = curr_fg_inds,
-                        max_sim=max_sim,
-                        argmax_indices=argmax_indices, 
-                    )
+                    if save_all_steps:
+                        if "all_max_sims" not in spatial_kwargs:
+                            spatial_kwargs["all_max_sims"] = dict()
+                            spatial_kwargs["all_argmax_indices"] = dict()
+                        spatial_kwargs["all_max_sims"][i] = max_sim.clone()
+                        spatial_kwargs["all_argmax_indices"][i] = argmax_indices.clone()
+                        
+                    if i == save_mask_point_step:
+                        id_fg_inds, curr_fg_inds = get_shared_fg_mask(
+                            spatial_kwargs["id_fg_mask"], 
+                            spatial_kwargs["curr_fg_mask"], 
+                            argmax_indices,
+                            max_sim>sim_thr
+                        )
+                        spatial_kwargs.update(
+                            id_fg_inds = id_fg_inds,
+                            curr_fg_inds = curr_fg_inds,
+                            max_sim=max_sim,
+                            argmax_indices=argmax_indices, 
+                        )
                 
                 if is_pre_run and (i == save_mask_point_step):
                     latents = (latents - self.scheduler.sigmas[i] * noise_pred)

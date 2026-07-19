@@ -8,6 +8,7 @@ parser.add_argument("--out_dir", type=str, default="results")
 parser.add_argument("--use_interpolate", action='store_true')
 parser.add_argument("--share_bg", action='store_true')
 parser.add_argument("--save_mask", action='store_true')
+parser.add_argument("--save_all_steps", action='store_true')
 parser.add_argument("--mix_mode", action='store_true')
 parser.add_argument("--height", type=int, default=1024)
 parser.add_argument("--width", type=int, default=1024)
@@ -138,6 +139,26 @@ def overlay_mask_on_image(image, mask, color, output_path):
     out_img = out_img.astype(np.uint8)
     Image.fromarray(out_img).save(output_path)
 
+def visualize_argmax_indices(image, argmax_indices, output_path):
+    img_array = np.array(image).astype(np.float32) * 0.5
+    h, w = img_array.shape[:2]
+    indices = argmax_indices.cpu().numpy().flatten()
+    if len(indices) == 0:
+        return
+    feat_h, feat_w = h // 16, w // 16
+    q_y = indices // feat_w
+    q_x = indices % feat_w
+    R = (q_x / feat_w) * 255.0
+    G = (q_y / feat_h) * 255.0
+    B = np.full_like(R, 128.0)
+    color_map = np.stack([R, G, B], axis=-1).astype(np.uint8)
+    color_map_2d = color_map.reshape(feat_h, feat_w, 3)
+    mask_resized = Image.fromarray(color_map_2d).resize((w, h), Image.NEAREST)
+    mask_resized = np.array(mask_resized).astype(np.float32)
+    out_img = np.concatenate([img_array + mask_resized * 0.5, mask_resized], axis=1)
+    out_img[out_img > 255] = 255
+    out_img = out_img.astype(np.uint8)
+    Image.fromarray(out_img).save(output_path)
 
 if __name__ == "__main__":
     # Model Init
@@ -148,7 +169,8 @@ if __name__ == "__main__":
         height = args.height,
         width = args.width,
         use_interpolate = args.use_interpolate,
-        share_bg = args.share_bg
+        share_bg = args.share_bg,
+        save_all_steps = args.save_all_steps
     )
 
     if args.mix_mode:
@@ -176,6 +198,12 @@ if __name__ == "__main__":
             overlay_mask_on_image(
                 id_images[0], id_fg_mask[0].cpu().numpy(), (255, 0, 0), f"{mask_out_dir}/id_mask.jpg"
             )
+            if args.save_all_steps and "all_fg_masks" in id_spatial_kwargs:
+                os.makedirs(f"{mask_out_dir}/id_all_steps", exist_ok=True)
+                for step_i, mask_t in id_spatial_kwargs["all_fg_masks"].items():
+                    overlay_mask_on_image(
+                        id_images[0], mask_t[0].cpu().numpy(), (255, 0, 0), f"{mask_out_dir}/id_all_steps/id_mask_step_{step_i:02d}.jpg"
+                    )
 
         spatial_kwargs = dict(id_fg_mask=id_fg_mask, id_bg_mask=~id_fg_mask)
         print("#" * 50)
@@ -206,6 +234,16 @@ if __name__ == "__main__":
                     (255, 0, 0),
                     f"{mask_out_dir}/{ind}_mask.jpg",
                 )
+            if args.save_all_steps:
+                os.makedirs(f"{mask_out_dir}/{ind}_all_steps", exist_ok=True)
+                if "all_fg_masks" in spatial_kwargs:
+                    for step_i, mask_t in spatial_kwargs["all_fg_masks"].items():
+                        overlay_mask_on_image(
+                            images[0], mask_t[0].cpu().numpy(), (255, 0, 0), f"{mask_out_dir}/{ind}_all_steps/mask_step_{step_i:02d}.jpg"
+                        )
+                if "all_argmax_indices" in spatial_kwargs:
+                    for step_i, indices_t in spatial_kwargs["all_argmax_indices"].items():
+                        visualize_argmax_indices(images[0], indices_t, f"{mask_out_dir}/{ind}_all_steps/match_step_{step_i:02d}.jpg")
         reset_id_bank(pipe)
         mix_prompt_parts = [part for scene in parse_prompt_scenes(args.prompts_file) for part in scene]
         save_story_visualization(args.out_dir, mix_prompt_parts)
@@ -233,6 +271,10 @@ if __name__ == "__main__":
             id_images[0].save(f"{out_dir}/id.jpg")
             if args.save_mask:
                 overlay_mask_on_image(id_images[0], id_fg_mask[0].cpu().numpy(), (255, 0, 0), f"{mask_out_dir}/id_mask.jpg")
+                if args.save_all_steps and "all_fg_masks" in id_spatial_kwargs:
+                    os.makedirs(f"{mask_out_dir}/id_all_steps", exist_ok=True)
+                    for step_i, mask_t in id_spatial_kwargs["all_fg_masks"].items():
+                        overlay_mask_on_image(id_images[0], mask_t[0].cpu().numpy(), (255, 0, 0), f"{mask_out_dir}/id_all_steps/id_mask_step_{step_i:02d}.jpg")
 
             # Frame Gen
             spatial_kwargs = dict(id_fg_mask = id_fg_mask, id_bg_mask = ~id_fg_mask)
@@ -248,6 +290,14 @@ if __name__ == "__main__":
                 images[0].save(f"{out_dir}/{ind}.jpg")
                 if args.save_mask:
                     overlay_mask_on_image(images[0], spatial_kwargs["curr_fg_mask"][0].cpu().numpy(), (255, 0, 0), f"{mask_out_dir}/{ind}_mask.jpg")
+                if args.save_all_steps:
+                    os.makedirs(f"{mask_out_dir}/{ind}_all_steps", exist_ok=True)
+                    if "all_fg_masks" in spatial_kwargs:
+                        for step_i, mask_t in spatial_kwargs["all_fg_masks"].items():
+                            overlay_mask_on_image(images[0], mask_t[0].cpu().numpy(), (255, 0, 0), f"{mask_out_dir}/{ind}_all_steps/mask_step_{step_i:02d}.jpg")
+                    if "all_argmax_indices" in spatial_kwargs:
+                        for step_i, indices_t in spatial_kwargs["all_argmax_indices"].items():
+                            visualize_argmax_indices(images[0], indices_t, f"{mask_out_dir}/{ind}_all_steps/match_step_{step_i:02d}.jpg")
             reset_id_bank(pipe)
             if prompt_ind < len(all_prompt_scenes):
                 save_story_visualization(out_dir, all_prompt_scenes[prompt_ind])

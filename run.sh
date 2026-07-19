@@ -12,7 +12,7 @@ for prompts_file in "$PROMPTS_FOLDER"/*.txt; do
 
   echo "Processing: $prompts_file"
   basename=$(basename "$prompts_file" .txt)
-  CUDA_VISIBLE_DEVICES=$GPU_ID python inference.py \
+  CUDA_VISIBLE_DEVICES=$GPU_ID python i nference.py \
     --init_mode 0 \
     --prompts_file "$prompts_file" \
     --model_path ../model/flux-dev \

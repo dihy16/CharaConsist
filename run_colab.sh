@@ -218,10 +218,11 @@ if [[ -n "${HF_TOKEN:-}" ]]; then
 fi
 
 # Extract and launch the maintainable remote runner in one kernel execution.
-# Capture and print the child output explicitly: Jupyter does not consistently
-# forward inherited subprocess streams. Record its exit code because some
-# colab-cli versions return zero even when the executed cell raises.
-colab_exec "import pathlib, subprocess, sys; root=pathlib.Path('$REMOTE_ROOT'); subprocess.run(['tar', '-xzf', str(root/'source.tar.gz'), '-C', str(root)], check=True); prompts=root/'prompts_batch'; prompts.mkdir(exist_ok=True); subprocess.run(['tar', '-xzf', str(root/'prompts.tar.gz'), '-C', str(prompts)], check=True); result=subprocess.run([sys.executable, str(root/'run_colab_remote.py'), '--root', str(root), '--prompts-dir', str(prompts), '--model-path', '$MODEL_PATH', '--model-repo', '$MODEL_REPO', '--init-mode', '$INIT_MODE'], cwd=root, capture_output=True, text=True); print(result.stdout, end=''); print(result.stderr, end='', file=sys.stderr); (root/'run-exit-code.txt').write_text(str(result.returncode), encoding='utf-8')"
+# Stream the child output explicitly: Jupyter does not consistently forward
+# inherited subprocess streams. Record its exit code because some colab-cli
+# versions return zero even when the executed cell raises. `deque` consumes
+# the line generator without accumulating the full model-download log.
+colab_exec "import pathlib, subprocess, sys; from collections import deque; root=pathlib.Path('$REMOTE_ROOT'); subprocess.run(['tar', '-xzf', str(root/'source.tar.gz'), '-C', str(root)], check=True); prompts=root/'prompts_batch'; prompts.mkdir(exist_ok=True); subprocess.run(['tar', '-xzf', str(root/'prompts.tar.gz'), '-C', str(prompts)], check=True); process=subprocess.Popen([sys.executable, str(root/'run_colab_remote.py'), '--root', str(root), '--prompts-dir', str(prompts), '--model-path', '$MODEL_PATH', '--model-repo', '$MODEL_REPO', '--init-mode', '$INIT_MODE'], cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1); deque((print(line, end='', flush=True) for line in process.stdout), maxlen=0); exit_code=process.wait(); (root/'run-exit-code.txt').write_text(str(exit_code), encoding='utf-8')"
 
 LOCAL_EXIT_CODE_FILE="$WORK_DIR/run-exit-code.txt"
 colab download -s "$SESSION_NAME" "$REMOTE_ROOT/run-exit-code.txt" "$LOCAL_EXIT_CODE_FILE"

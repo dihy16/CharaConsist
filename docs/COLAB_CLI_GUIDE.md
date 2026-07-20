@@ -38,7 +38,7 @@ colab stop -s <session_name>
 
 ### Execute Python Code
 ```bash
-colab exec -s <session_name> "python code here"
+printf '%s\n' "print('hello from Colab')" | colab exec -s <session_name>
 ```
 - One-shot code execution
 - Use stdin piping for multi-line scripts:
@@ -143,6 +143,26 @@ bash run_colab.sh prompts/stress_test my-session \
 uploads the local source tree and the entire prompt-folder tree, but does not
 upload FLUX weights. Put the model on the VM first (for example, by mounting
 Google Drive) because model uploads are large and a new Colab VM is empty.
+When the supplied path starts with `/content/drive/`, the wrapper runs
+`colab drivemount` automatically and may open a browser authorization flow.
+If the model directory is absent, the wrapper downloads
+`black-forest-labs/FLUX.1-dev` from Hugging Face into that location. Because
+the repository is gated, accept its license on Hugging Face and put a read
+token in the project's local `.env` file:
+
+```bash
+echo 'HF_TOKEN=hf_your_read_token' >> .env
+./run_colab.sh prompts/stress_test my-session \
+  --model-path /content/drive/MyDrive/models/flux-dev --gpu T4
+```
+
+An already-exported `HF_TOKEN` takes precedence over `.env`. The token is
+uploaded as a temporary credential file and deleted by the remote runner,
+which authenticates with `hf auth login --token "$HF_TOKEN"` and downloads
+with `hf download ... --local-dir ...`. Use `--model-repo owner/name` to select
+a different Hugging Face model repository.
+The wrapper gives setup and inference commands a two-hour timeout by default;
+override it with `--timeout <seconds>` for larger batches.
 
 ### Workflow Steps (Automated)
 1. **Create session** with specified GPU
@@ -173,7 +193,7 @@ colab run --keep --gpu L4 inference.py
 
 # Terminal 2: Monitor (in another shell)
 colab status -s run-xxxxxx
-colab exec -s run-xxxxxx "nvidia-smi"
+printf '%s\n' "import subprocess; subprocess.run(['nvidia-smi'])" | colab exec -s run-xxxxxx
 ```
 
 ### Debug a Failed Run
@@ -205,8 +225,8 @@ colab download -s my-session "/root/CharaConsist/results/bg_fg/test_001" ./local
 colab new -s my-session --gpu L4
 
 # Run multiple times
-colab exec -s my-session "python inference.py --prompts_file ..."
-colab exec -s my-session "python another_task.py"
+printf '%s\n' "# Python code to run on the VM" | colab exec -s my-session
+cat another_task.py | colab exec -s my-session
 
 # Clean up when done
 colab stop -s my-session
@@ -223,4 +243,5 @@ colab stop -s my-session
 | Keep-alive expired | Session auto-stops after ~90 mins of inactivity; use `--keep` to override |
 | GPU quota exceeded | Request quota increase or switch to T4 (free tier) |
 | Authentication fails | Run `colab auth --auth=adc` or `gcloud auth application-default login` |
+| Kernel startup read timeout immediately after `Session READY` | The wrapper retries kernel readiness six times because the Jupyter endpoint can lag behind VM allocation |
 

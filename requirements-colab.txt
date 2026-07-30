@@ -1,0 +1,11 @@
+# Application dependencies only. Colab already provides a mutually compatible
+# PyTorch/CUDA/NCCL stack; installing the nvidia-* pins from requirements.txt
+# replaces parts of that stack and breaks libtorch_cuda.so.
+accelerate==1.6.0
+diffusers==0.32.2
+einops==0.8.2
+hf-xet==1.5.0
+huggingface_hub==0.25.2
+opencv-python==4.13.0.92
+pillow==11.3.0
+transformers==4.47.1

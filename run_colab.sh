@@ -164,7 +164,7 @@ echo "  Attention masks: enabled"
 echo "  Colab command timeout: ${EXEC_TIMEOUT}s"
 
 # Upload only project source. Model weights stay at the supplied remote path.
-tar -C "$SCRIPT_DIR" -czf "$SOURCE_ARCHIVE" inference.py make_story_image.py run_colab_remote.py requirements.txt models
+tar -C "$SCRIPT_DIR" -czf "$SOURCE_ARCHIVE" inference.py make_story_image.py run_colab_bootstrap.py run_colab_remote.py requirements-colab.txt models
 tar -C "$PROMPTS_FOLDER" -czf "$PROMPTS_ARCHIVE" .
 
 NEW_COMMAND=(colab new -s "$SESSION_NAME")
@@ -217,12 +217,10 @@ if [[ -n "${HF_TOKEN:-}" ]]; then
   colab upload -s "$SESSION_NAME" "$LOCAL_HF_TOKEN_FILE" "$REMOTE_ROOT/.hf_token"
 fi
 
-# Extract and launch the maintainable remote runner in one kernel execution.
-# Stream the child output explicitly: Jupyter does not consistently forward
-# inherited subprocess streams. Record its exit code because some colab-cli
-# versions return zero even when the executed cell raises. `deque` consumes
-# the line generator without accumulating the full model-download log.
-colab_exec "import pathlib, subprocess, sys; from collections import deque; root=pathlib.Path('$REMOTE_ROOT'); subprocess.run(['tar', '-xzf', str(root/'source.tar.gz'), '-C', str(root)], check=True); prompts=root/'prompts_batch'; prompts.mkdir(exist_ok=True); subprocess.run(['tar', '-xzf', str(root/'prompts.tar.gz'), '-C', str(prompts)], check=True); process=subprocess.Popen([sys.executable, str(root/'run_colab_remote.py'), '--root', str(root), '--prompts-dir', str(prompts), '--model-path', '$MODEL_PATH', '--model-repo', '$MODEL_REPO', '--init-mode', '$INIT_MODE'], cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1); deque((print(line, end='', flush=True) for line in process.stdout), maxlen=0); exit_code=process.wait(); (root/'run-exit-code.txt').write_text(str(exit_code), encoding='utf-8')"
+# Extract the small Python bootstrap, then let it stream the remote runner's
+# output and record the real exit code. Keeping this logic in Python avoids
+# fragile shell quoting around generators and subprocess streams.
+colab_exec "import pathlib, runpy, subprocess, sys; root=pathlib.Path('$REMOTE_ROOT'); subprocess.run(['tar', '-xzf', str(root/'source.tar.gz'), '-C', str(root)], check=True); sys.argv=['run_colab_bootstrap.py', '--root', str(root), '--model-path', '$MODEL_PATH', '--model-repo', '$MODEL_REPO', '--init-mode', '$INIT_MODE']; runpy.run_path(str(root/'run_colab_bootstrap.py'), run_name='__main__')"
 
 LOCAL_EXIT_CODE_FILE="$WORK_DIR/run-exit-code.txt"
 colab download -s "$SESSION_NAME" "$REMOTE_ROOT/run-exit-code.txt" "$LOCAL_EXIT_CODE_FILE"

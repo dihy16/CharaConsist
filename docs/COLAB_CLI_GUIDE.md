@@ -168,10 +168,12 @@ override it with `--timeout <seconds>` for larger batches.
 1. **Create session** with specified GPU
 2. **Upload** the source files and prompt-folder contents to
    `/content/CharaConsist`
-3. **Run inference** for every `.txt` file in that uploaded folder (including
+3. **Install Colab-safe dependencies** without replacing Colab's preinstalled
+   PyTorch, CUDA, or NCCL packages
+4. **Run inference** for every `.txt` file in that uploaded folder (including
    nested folders), with `--save_mask` enabled
-4. **Download results** to `./results_colab`
-5. **Cleanup** - stop session (unless `--keep` flag)
+5. **Download results** to `./results_colab`
+6. **Cleanup** - stop session (unless `--keep` flag)
 
 ### Key Differences from Original
 | Aspect | Original `run.sh` | `run_colab.sh` |
@@ -244,4 +246,7 @@ colab stop -s my-session
 | GPU quota exceeded | Request quota increase or switch to T4 (free tier) |
 | Authentication fails | Run `colab auth --auth=adc` or `gcloud auth application-default login` |
 | Kernel startup read timeout immediately after `Session READY` | The wrapper retries kernel readiness six times because the Jupyter endpoint can lag behind VM allocation |
+| `libtorch_cuda.so: undefined symbol: nccl...` | Start a fresh session and use `requirements-colab.txt`; installing the original pinned `nvidia-*` packages replaces Colab's compatible NCCL runtime |
+| `cannot import name ... from huggingface_hub` | Start a fresh session; the Colab requirements pin Diffusers 0.32.2, Transformers 4.47.1, and huggingface-hub 0.25.2 together instead of mixing them with Colab's newer preinstalled stack |
+| Model index exists but a `.safetensors` shard is missing | Keep the partial Drive folder and rerun with `HF_TOKEN` configured; the wrapper validates every indexed shard and `hf download` resumes missing files |
 

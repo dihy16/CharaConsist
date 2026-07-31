@@ -13,6 +13,7 @@ from diffusers.models.attention_processor import Attention
 from diffusers.models.embeddings import apply_rotary_emb
 
 from tqdm import tqdm
+from .action_gating import action_gated_merge_weights, normalize_action_attention
 
 
 class FluxAttnProcessor2_0:
@@ -136,6 +137,7 @@ class CharaConsistAttnProcessor2_0:
         self.bg_share_flag = bg_share_flag
         # Sample Info
         self.bg_len = 0
+        self.action_start = 0
         self.real_len = 0
         self.size = size
         # Save id info
@@ -148,8 +150,12 @@ class CharaConsistAttnProcessor2_0:
         attn_weights = attn_weights.softmax(-1).sum(1)
         attn_weights = rearrange(attn_weights, "b (h w) s -> b s h w", h=self.size[0], w=self.size[1])
         bg_attn_weights = attn_weights[:, :self.bg_len].mean(1)
-        fg_attn_weights = attn_weights[:, self.bg_len:].mean(1)       
-        return bg_attn_weights, fg_attn_weights
+        fg_attn_weights = attn_weights[:, self.bg_len:].mean(1)
+        if self.action_start < self.real_len:
+            action_attn_weights = attn_weights[:, self.action_start:].mean(1)
+        else:
+            action_attn_weights = torch.zeros_like(fg_attn_weights)
+        return bg_attn_weights, fg_attn_weights, action_attn_weights
     
     def get_curr_cross_sim(self, curr_hidden_states, timestep_ind):
         id_hidden_states = self.id_attn_bank[timestep_ind]["attn_out"].to(curr_hidden_states.device, non_blocking=True)
@@ -236,17 +242,41 @@ class CharaConsistAttnProcessor2_0:
         return saved_key, saved_value, attention_mask
     
     
-    def ada_tome(self, hidden_states, timestep_ind, alpha, id_fg_inds=None, curr_fg_inds=None, max_sim=None, **kwargs):
+    def ada_tome(
+        self,
+        hidden_states,
+        timestep_ind,
+        alpha,
+        id_fg_inds=None,
+        curr_fg_inds=None,
+        max_sim=None,
+        action_scores=None,
+        action_gate_strength=1.0,
+        **kwargs,
+    ):
+        id_fg_inds = id_fg_inds.reshape(-1)
+        curr_fg_inds = curr_fg_inds.reshape(-1)
         id_hidden_states = self.id_attn_bank[timestep_ind]["attn_out"].to(hidden_states.device, non_blocking=True)
         vision_hidden_states = hidden_states[:, self.text_seq_len:, :]
         matched_id_hidden_states = id_hidden_states[:, id_fg_inds]
         matched_curr_hidden_states = vision_hidden_states[:, curr_fg_inds]
 
-        alpha_tensor = torch.ones_like(curr_fg_inds, dtype=torch.bfloat16)
-        alpha_tensor = alpha_tensor * alpha
-        sim_weight = max_sim.flatten()[curr_fg_inds]
-        alpha_tensor = alpha_tensor * sim_weight
-        alpha_tensor = alpha_tensor.view(1, -1, 1)
+        sim_weight = max_sim.flatten()[curr_fg_inds].to(
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        matched_action_scores = None
+        if action_scores is not None:
+            matched_action_scores = action_scores.flatten()[curr_fg_inds].to(
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+        alpha_tensor = action_gated_merge_weights(
+            alpha,
+            sim_weight,
+            matched_action_scores,
+            gate_strength=action_gate_strength,
+        ).view(1, -1, 1)
 
         new_matched_curr_hidden_states = (1 - alpha_tensor) * matched_curr_hidden_states + alpha_tensor * matched_id_hidden_states
         vision_hidden_states[:, curr_fg_inds] = new_matched_curr_hidden_states
@@ -273,6 +303,7 @@ class CharaConsistAttnProcessor2_0:
         bg_inter_img_attn: bool = False,
         attn_out_interpolate: bool = False,
         interpolate_weight_dict: dict = dict(),
+        action_gate_strength: float = 1.0,
         spatial_kwargs: Optional[dict] = None,
         **kwargs,
     ) -> torch.FloatTensor:
@@ -339,8 +370,12 @@ class CharaConsistAttnProcessor2_0:
             key = apply_rotary_emb(key, image_rotary_emb)
 
         if save_attn_weight:
-            bg_attn, fg_attn = self.get_curr_attn_weights(query, key)
-            self.attn_weights = dict(bg = bg_attn.to("cuda:0", non_blocking=True), fg = fg_attn.to("cuda:0", non_blocking=True))
+            bg_attn, fg_attn, action_attn = self.get_curr_attn_weights(query, key)
+            self.attn_weights = dict(
+                bg=bg_attn.to("cuda:0", non_blocking=True),
+                fg=fg_attn.to("cuda:0", non_blocking=True),
+                action=action_attn.to("cuda:0", non_blocking=True),
+            )
         
         fg_share_flag = self.fg_share_flag and fg_inter_img_attn
         bg_share_flag = self.bg_share_flag and bg_inter_img_attn and (not update_attn_kv)
@@ -373,7 +408,13 @@ class CharaConsistAttnProcessor2_0:
 
         if attn_out_interpolate:
             if fg_share_flag:
-                hidden_states = self.ada_tome(hidden_states, timestep_ind, interpolate_weight_dict[timestep_ind], **spatial_kwargs)
+                hidden_states = self.ada_tome(
+                    hidden_states,
+                    timestep_ind,
+                    interpolate_weight_dict[timestep_ind],
+                    action_gate_strength=action_gate_strength,
+                    **spatial_kwargs,
+                )
 
         if encoder_hidden_states is not None:
             encoder_hidden_states, hidden_states = (
@@ -412,16 +453,26 @@ def reset_attn_processor(pipe, size, fg_share_freq=2, bg_share_freq=1):
     print(f"{reset_num} layers have been reset")
 
 
-def set_text_len(pipe, bg_len, real_len):
+def set_text_spans(pipe, bg_len, action_start, real_len):
     attn_processors = pipe.transformer.attn_processors
     reset_num = 0
     for name in attn_processors:
         processor = attn_processors[name]
         if isinstance(processor, CharaConsistAttnProcessor2_0):
             processor.bg_len = bg_len
+            processor.action_start = min(action_start, real_len)
             processor.real_len = real_len
             reset_num += 1
-    print(f"{reset_num} layers' background and real text length have been reset to {bg_len} and {real_len}.")
+    print(
+        f"{reset_num} layers' text spans have been reset to "
+        f"background_end={bg_len}, action_start={min(action_start, real_len)}, "
+        f"real_end={real_len}."
+    )
+
+
+def set_text_len(pipe, bg_len, real_len):
+    """Backward-compatible span setter with action gating disabled."""
+    set_text_spans(pipe, bg_len, real_len, real_len)
 
 def remove_small_holes_and_points(mask_tensor):
     n, h, w = mask_tensor.shape
@@ -436,9 +487,9 @@ def remove_small_holes_and_points(mask_tensor):
     results = torch.stack(results, dim=0).to(mask_tensor.device, dtype=mask_tensor.dtype)
     return results
 
-def get_curr_fg_mask(pipe):
+def get_curr_fg_mask_and_action_scores(pipe):
     attn_processors = pipe.transformer.attn_processors
-    all_attn_weights = dict(bg = [], fg = [])
+    all_attn_weights = dict(bg=[], fg=[], action=[])
     for name in attn_processors:
         processor = attn_processors[name]
         if isinstance(processor, CharaConsistAttnProcessor2_0):
@@ -448,7 +499,16 @@ def get_curr_fg_mask(pipe):
             processor.attn_weights = dict()
     bg_attns = sum(all_attn_weights["bg"]) / len(all_attn_weights["bg"])
     fg_attns = sum(all_attn_weights["fg"]) / len(all_attn_weights["fg"])
-    return remove_small_holes_and_points(bg_attns <= fg_attns)
+    action_attns = sum(all_attn_weights["action"]) / len(all_attn_weights["action"])
+    foreground_mask = remove_small_holes_and_points(bg_attns <= fg_attns)
+    action_scores = normalize_action_attention(action_attns, foreground_mask)
+    return foreground_mask, action_scores
+
+
+def get_curr_fg_mask(pipe):
+    """Backward-compatible foreground-only attention aggregation."""
+    foreground_mask, _ = get_curr_fg_mask_and_action_scores(pipe)
+    return foreground_mask
 
 def get_cross_sim(pipe):
     attn_processors = pipe.transformer.attn_processors

@@ -77,8 +77,20 @@ We provide a batch generation script in `inference.py`. Its functionality is ess
 - `model_path`: Path to the pre-trained [FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev) model weights.
 - `out_dir`: The path where the output results will be saved.
 - `use_interpolate`: Whether to use adaptive token merge. Enabling it improves consistency but increases CPU memory consumption.
+- `action_gate_strength`: How strongly action-token attention suppresses adaptive identity merging in action-sensitive foreground regions. The range is `0` (original merge behavior) to `1` (full gating), with a default of `1`.
 - `share_bg`: Whether to preserve the background unchanged
 - `save_mask`: Whether to save the automatically extracted masks during the generation process for visualization
+
+Prompt lines use the existing three-part format:
+
+```text
+background # character # action
+```
+
+The action text is not a new model token type. CharaConsist tracks its
+cumulative T5 token span, derives a continuous image-to-action attention map,
+and uses that map when `--use_interpolate` enables adaptive token merge.
+Foreground mask extraction and point-tracking attention masking are unchanged.
 
 Generating consistent character in a fixed background:
 ```bash

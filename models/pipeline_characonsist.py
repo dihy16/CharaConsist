@@ -11,7 +11,10 @@ from diffusers.pipelines.flux.pipeline_flux import retrieve_timesteps, calculate
 from diffusers.pipelines.flux.pipeline_output import FluxPipelineOutput
 from diffusers.utils.torch_utils import randn_tensor
 
-from .attention_processor_characonsist import get_curr_fg_mask, get_cross_sim
+from .attention_processor_characonsist import (
+    get_curr_fg_mask_and_action_scores,
+    get_cross_sim,
+)
 
 
 def get_interpolate_weight(weight, start_step, decay_step, end_step):
@@ -32,7 +35,7 @@ def get_shared_fg_mask(id_fg_mask, curr_fg_mask, curr2id_argmax_indices, curr2id
     rearrange_id_fg_mask = id_fg_mask[curr2id_argmax_indices[0]]
     share_fg_mask = curr_fg_mask & rearrange_id_fg_mask & curr_valid_mask
     id_share_fg_indices = curr2id_argmax_indices[0][share_fg_mask]
-    curr_share_fg_indices = torch.nonzero(share_fg_mask).squeeze()
+    curr_share_fg_indices = torch.nonzero(share_fg_mask, as_tuple=True)[0]
     return id_share_fg_indices, curr_share_fg_indices
 
 
@@ -71,6 +74,7 @@ class CharaConsistPipeline(FluxPipeline):
         interpolate_decay_step: int = 11,
         interpolate_end_step: int = 31,
         interpolate_weight: float = 0.8,
+        action_gate_strength: float = 1.0,
         sim_thr = 0.5,
         save_mask_point_step: int = 10,
         save_all_steps: bool = False
@@ -78,6 +82,11 @@ class CharaConsistPipeline(FluxPipeline):
         
         height = height or self.default_sample_size * self.vae_scale_factor
         width = width or self.default_sample_size * self.vae_scale_factor
+        if not 0.0 <= action_gate_strength <= 1.0:
+            raise ValueError(
+                "action_gate_strength must be between 0 and 1, "
+                f"got {action_gate_strength}."
+            )
 
         # 1. Check inputs. Raise error if not correct
         self.check_inputs(
@@ -210,6 +219,7 @@ class CharaConsistPipeline(FluxPipeline):
                 bg_inter_img_attn = bg_inter_img_attn,
                 attn_out_interpolate = attn_out_interpolate,
                 interpolate_weight_dict=interpolate_weight_dict,
+                action_gate_strength=action_gate_strength,
                 spatial_kwargs=spatial_kwargs)
 
         # 6. Denoising loop
@@ -236,12 +246,13 @@ class CharaConsistPipeline(FluxPipeline):
                 )[0]
 
                 if self.joint_attention_kwargs["save_attn_weight"]:
-                    curr_fg_mask = get_curr_fg_mask(self)
+                    curr_fg_mask, action_scores = get_curr_fg_mask_and_action_scores(self)
                     if save_all_steps:
                         if "all_fg_masks" not in spatial_kwargs:
                             spatial_kwargs["all_fg_masks"] = dict()
                         spatial_kwargs["all_fg_masks"][i] = curr_fg_mask.clone()
                     spatial_kwargs["curr_fg_mask"] = curr_fg_mask
+                    spatial_kwargs["action_scores"] = action_scores
                     if update_bg:
                         spatial_kwargs["id_bg_mask"] = copy.deepcopy(~curr_fg_mask)
                         

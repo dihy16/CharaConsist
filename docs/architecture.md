@@ -70,14 +70,17 @@ background # character # action
 Blank lines delimit scenes. For each non-blank line, the runner computes:
 
 - `bg_len`: the number of background tokens;
+- `action_start`: the first token in the existing action field;
 - `real_len`: the number of tokens in the complete prompt; and
 - the concatenated FLUX prompt.
 
-Those token boundaries let the attention processors separate background and
-foreground attention. In normal mode each blank-line-delimited scene becomes a
-separate `prompt_<n>` output directory. In `--mix_mode`, all scenes are
-flattened into one sequence and the first frame of a later scene is marked
-`update_bg=True`.
+The cumulative boundaries let the attention processors separate background,
+foreground, and action attention without assuming that independently tokenized
+fragment lengths are additive. Foreground remains the combined character and
+action range for backward-compatible mask extraction. In normal mode each
+blank-line-delimited scene becomes a separate `prompt_<n>` output directory.
+In `--mix_mode`, all scenes are flattened into one sequence and the first frame
+of a later scene is marked `update_bg=True`.
 
 ## Generation Flow
 
@@ -96,12 +99,14 @@ flattened into one sequence and the first frame of a later scene is marked
    OpenCV erosion/dilation removes small artifacts.
 4. **Pre-run for each later frame** — the pipeline invokes the new prompt with
    `is_pre_run=True`. It obtains cross-image similarity between current and
-   identity attention outputs and identifies corresponding foreground tokens.
+   identity attention outputs, identifies corresponding foreground tokens, and
+   aggregates a continuous action-attention map over the current foreground.
 5. **Frame generation** — the normal invocation reuses the identity bank.
    Custom attention expands the current key/value tensors with selected
    identity foreground and/or background tokens. Its attention mask prevents
    invalid foreground/background connections. Matched foreground hidden states
-   can also be blended using an adaptive token-merge weight.
+   can also be blended using an adaptive token-merge weight. That merge weight
+   is reduced per token by normalized action attention.
 6. **Output writing** — the identity image, intermediate `_pre` image, and
    final frames are saved. `--save_mask` writes visual foreground-mask
    overlays; `--save_all_steps` additionally writes per-step mask and matching
@@ -139,10 +144,11 @@ blocks. The custom processor owns the state that connects frames:
 
 | State | Purpose |
 | --- | --- |
-| `attn_weights` | Background and foreground text-attention maps used to extract the current foreground mask. |
+| `attn_weights` | Background, foreground, and action text-attention maps used for mask extraction and merge gating. |
 | `id_attn_bank` | Identity key/value tensors and attention outputs indexed by diffusion timestep. |
 | `cross_sims` | Current-to-identity visual-token similarity used to find point matches. |
-| `bg_len`, `real_len` | Prompt token boundaries supplied by the runner. |
+| `bg_len`, `action_start`, `real_len` | Cumulative prompt token boundaries supplied by the runner. |
+| `action_scores` | Normalized continuous action-attention map used to gate adaptive token merge. |
 
 It builds a boolean expanded-attention mask, converts blocked connections to
 `-inf`, and supplies it to PyTorch scaled-dot-product attention. The helper
@@ -205,4 +211,3 @@ Mix mode writes `id.jpg`, numbered pre/final frames, optional masks, and
   they do not alter inference semantics. A fresh remote environment must have
   the source tree, dependencies, and model weights available before
   `inference.py` can run.
-

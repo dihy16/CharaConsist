@@ -164,7 +164,7 @@ echo "  Attention masks: enabled"
 echo "  Colab command timeout: ${EXEC_TIMEOUT}s"
 
 # Upload only project source. Model weights stay at the supplied remote path.
-tar -C "$SCRIPT_DIR" -czf "$SOURCE_ARCHIVE" inference.py make_story_image.py run_colab_bootstrap.py run_colab_remote.py requirements-colab.txt models
+tar -C "$SCRIPT_DIR" -czf "$SOURCE_ARCHIVE" inference.py prompt_utils.py make_story_image.py run_colab_bootstrap.py run_colab_remote.py requirements-colab.txt models
 tar -C "$PROMPTS_FOLDER" -czf "$PROMPTS_ARCHIVE" .
 
 NEW_COMMAND=(colab new -s "$SESSION_NAME")
@@ -225,11 +225,15 @@ colab_exec "import pathlib, runpy, subprocess, sys; root=pathlib.Path('$REMOTE_R
 LOCAL_EXIT_CODE_FILE="$WORK_DIR/run-exit-code.txt"
 colab download -s "$SESSION_NAME" "$REMOTE_ROOT/run-exit-code.txt" "$LOCAL_EXIT_CODE_FILE"
 REMOTE_EXIT_CODE="$(tr -d '[:space:]' < "$LOCAL_EXIT_CODE_FILE")"
-if [[ "$REMOTE_EXIT_CODE" != 0 ]]; then
-  echo "Error: remote setup or inference failed with exit code $REMOTE_EXIT_CODE" >&2
-  exit "$REMOTE_EXIT_CODE"
-fi
 
 mkdir -p "$LOCAL_OUTPUT_DIR"
-colab download -s "$SESSION_NAME" "$REMOTE_RESULTS" "$LOCAL_OUTPUT_DIR"
-echo "Results downloaded to: $LOCAL_OUTPUT_DIR"
+if colab download -s "$SESSION_NAME" "$REMOTE_RESULTS" "$LOCAL_OUTPUT_DIR"; then
+  echo "Results downloaded to: $LOCAL_OUTPUT_DIR"
+else
+  echo "Warning: no remote results could be downloaded" >&2
+fi
+
+if [[ "$REMOTE_EXIT_CODE" != 0 ]]; then
+  echo "Error: remote setup or one or more prompt files failed (exit code $REMOTE_EXIT_CODE)" >&2
+  exit "$REMOTE_EXIT_CODE"
+fi

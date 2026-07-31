@@ -124,11 +124,14 @@ def main() -> int:
     if not prompt_files:
         raise RuntimeError(f"No .txt files found in {prompts_dir}")
 
+    failures = []
     for index, prompt_file in enumerate(prompt_files, start=1):
         relative_output = prompt_file.relative_to(prompts_dir).with_suffix("")
         output_dir = root / "results" / "bg_fg" / relative_output
+        staging_dir = root / "results_in_progress" / relative_output
+        shutil.rmtree(staging_dir, ignore_errors=True)
         print(f"[{index}/{len(prompt_files)}] Processing {prompt_file}", flush=True)
-        subprocess.run(
+        completed = subprocess.run(
             [
                 sys.executable,
                 "inference.py",
@@ -139,14 +142,45 @@ def main() -> int:
                 "--model_path",
                 str(model_path),
                 "--out_dir",
-                str(output_dir),
+                str(staging_dir),
                 "--save_mask",
             ],
             cwd=root,
-            check=True,
+            check=False,
         )
+        if completed.returncode == 0:
+            output_dir.parent.mkdir(parents=True, exist_ok=True)
+            shutil.rmtree(output_dir, ignore_errors=True)
+            staging_dir.replace(output_dir)
+            print(f"[{index}/{len(prompt_files)}] Saved results for {prompt_file}", flush=True)
+        else:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            failures.append(
+                {
+                    "prompt_file": str(prompt_file.relative_to(prompts_dir)),
+                    "exit_code": completed.returncode,
+                }
+            )
+            print(
+                f"[{index}/{len(prompt_files)}] FAILED {prompt_file} "
+                f"(exit code {completed.returncode}); continuing",
+                file=sys.stderr,
+                flush=True,
+            )
 
-    return 0
+    summary = {
+        "total": len(prompt_files),
+        "succeeded": len(prompt_files) - len(failures),
+        "failed": failures,
+    }
+    summary_path = root / "results" / "batch-summary.json"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    print(
+        f"Batch complete: {summary['succeeded']}/{summary['total']} prompt files succeeded",
+        flush=True,
+    )
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

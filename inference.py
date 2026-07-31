@@ -6,6 +6,12 @@ parser.add_argument("--prompts_file", type=str, default="")
 parser.add_argument("--model_path", type=str, default="/path/to/FLUX.1-dev")
 parser.add_argument("--out_dir", type=str, default="results")
 parser.add_argument("--use_interpolate", action='store_true')
+parser.add_argument(
+    "--action_gate_strength",
+    type=float,
+    default=1.0,
+    help="Action-attention suppression for adaptive token merge (0 disables, 1 is full gating).",
+)
 parser.add_argument("--share_bg", action='store_true')
 parser.add_argument("--save_mask", action='store_true')
 parser.add_argument("--save_all_steps", action='store_true')
@@ -22,11 +28,12 @@ import numpy as np
 
 from models.attention_processor_characonsist import (
     reset_attn_processor,
-    set_text_len,
+    set_text_spans,
     reset_size,
     reset_id_bank,
 )
 from models.pipeline_characonsist import CharaConsistPipeline
+from prompt_utils import build_prompt_and_spans
 
 
 def init_model_mode_0():
@@ -67,57 +74,65 @@ MODEL_INIT_FUNCS = {
     3: init_model_mode_3
 }
 
-def get_text_tokens_length(pipe, p):
-    text_mask = pipe.tokenizer_2(
-        p,
-        padding="max_length",
-        max_length=512,
-        truncation=True,
-        return_length=False,
-        return_overflowing_tokens=False,
-        return_tensors="pt",
-    ).attention_mask
-    return text_mask.sum().item() - 1
-
 def modify_prompt_and_get_length(bg, fg, act, pipe):
-    bg += " "
-    fg += " "
-    prompt = bg + fg + act
-    return prompt, get_text_tokens_length(pipe, bg), get_text_tokens_length(pipe, prompt)
+    """Backward-compatible wrapper returning the new cumulative spans."""
+    return build_prompt_and_spans(bg, fg, act, pipe)
             
 def load_prompt_file(pipe, file_path):
     with open(file_path, "r") as f:
         all_lines = f.readlines()
-    all_prompt_info, curr_prompts, curr_bg_len, curr_real_len = [], [], [], []
-    for line in all_lines:
+    all_prompt_info = []
+    curr_prompts, curr_bg_len, curr_action_start, curr_real_len = [], [], [], []
+    for line_number, line in enumerate(all_lines, start=1):
         prompt = line.strip()
         if len(prompt) > 0:
-            bg, fg, act = prompt.split("#")
-            prompt, bg_len, real_len = modify_prompt_and_get_length(bg, fg, act, pipe)
+            prompt_parts = prompt.split("#", 2)
+            if len(prompt_parts) != 3:
+                raise ValueError(
+                    f"Invalid prompt at line {line_number}: expected background#foreground#action."
+                )
+            bg, fg, act = prompt_parts
+            prompt, bg_len, action_start, real_len = modify_prompt_and_get_length(
+                bg, fg, act, pipe
+            )
             curr_prompts.append(prompt)
             curr_bg_len.append(bg_len)
+            curr_action_start.append(action_start)
             curr_real_len.append(real_len)
         else:
-            all_prompt_info.append((curr_prompts, curr_bg_len, curr_real_len))
-            curr_prompts, curr_bg_len, curr_real_len = [], [], []
+            if curr_prompts:
+                all_prompt_info.append(
+                    (curr_prompts, curr_bg_len, curr_action_start, curr_real_len)
+                )
+            curr_prompts, curr_bg_len, curr_action_start, curr_real_len = [], [], [], []
     if len(curr_prompts) > 0:
-        all_prompt_info.append((curr_prompts, curr_bg_len, curr_real_len))
+        all_prompt_info.append(
+            (curr_prompts, curr_bg_len, curr_action_start, curr_real_len)
+        )
     return all_prompt_info
 
 def load_mix_prompt_file(pipe, file_path):
     scenes = load_prompt_file(pipe, file_path)
-    story_prompts, story_bg_lens, story_real_lens, story_meta_info = [], [], [], []
-    for scene_ind, (prompts, bg_lens, real_lens) in enumerate(scenes):
+    story_prompts, story_bg_lens = [], []
+    story_action_starts, story_real_lens, story_meta_info = [], [], []
+    for scene_ind, (prompts, bg_lens, action_starts, real_lens) in enumerate(scenes):
         for prompt_ind, prompt in enumerate(prompts):
             story_prompts.append(prompt)
             story_bg_lens.append(bg_lens[prompt_ind])
+            story_action_starts.append(action_starts[prompt_ind])
             story_real_lens.append(real_lens[prompt_ind])
             story_meta_info.append(
                 dict(
                     update_bg=(scene_ind > 0 and prompt_ind == 0),
                 )
             )
-    return story_prompts, story_bg_lens, story_real_lens, story_meta_info
+    return (
+        story_prompts,
+        story_bg_lens,
+        story_action_starts,
+        story_real_lens,
+        story_meta_info,
+    )
 
 from PIL import Image
 from make_story_image import parse_prompt_scenes, save_story_visualization
@@ -169,12 +184,15 @@ if __name__ == "__main__":
         height = args.height,
         width = args.width,
         use_interpolate = args.use_interpolate,
+        action_gate_strength = args.action_gate_strength,
         share_bg = args.share_bg,
         save_all_steps = args.save_all_steps
     )
 
     if args.mix_mode:
-        prompts, bg_lens, real_lens, meta_info = load_mix_prompt_file(pipe, args.prompts_file)
+        prompts, bg_lens, action_starts, real_lens, meta_info = load_mix_prompt_file(
+            pipe, args.prompts_file
+        )
         if len(prompts) == 0:
             raise ValueError("No prompts found in prompts_file.")
 
@@ -188,7 +206,7 @@ if __name__ == "__main__":
 
         print("#" * 50)
         print("Generating ID image ...")
-        set_text_len(pipe, bg_lens[0], real_lens[0])
+        set_text_spans(pipe, bg_lens[0], action_starts[0], real_lens[0])
         id_images, id_spatial_kwargs = pipe(
             id_prompt, is_id=True, generator=torch.Generator("cpu").manual_seed(args.seed), **pipe_kwargs
         )
@@ -211,7 +229,12 @@ if __name__ == "__main__":
         for ind, prompt in enumerate(frm_prompts):
             curr_pipe_kwargs = dict(pipe_kwargs)
             curr_pipe_kwargs.update(meta_info[ind + 1])
-            set_text_len(pipe, bg_lens[ind + 1], real_lens[ind + 1])
+            set_text_spans(
+                pipe,
+                bg_lens[ind + 1],
+                action_starts[ind + 1],
+                real_lens[ind + 1],
+            )
             pre_images, spatial_kwargs = pipe(
                 prompt,
                 is_pre_run=True,
@@ -252,7 +275,7 @@ if __name__ == "__main__":
         all_prompt_info = load_prompt_file(pipe, args.prompts_file)
         all_prompt_scenes = parse_prompt_scenes(args.prompts_file)
 
-        for prompt_ind, (prompts, bg_lens, real_lens) in enumerate(all_prompt_info):
+        for prompt_ind, (prompts, bg_lens, action_starts, real_lens) in enumerate(all_prompt_info):
             out_dir = os.path.join(args.out_dir, f"prompt_{prompt_ind}")
             os.makedirs(out_dir, exist_ok=True)
             if args.save_mask:
@@ -264,7 +287,7 @@ if __name__ == "__main__":
             # ID Gen
             print("#" * 50)
             print("Generating ID image ...")
-            set_text_len(pipe, bg_lens[0], real_lens[0])
+            set_text_spans(pipe, bg_lens[0], action_starts[0], real_lens[0])
             id_images, id_spatial_kwargs = pipe(
                 id_prompt, is_id=True, generator = torch.Generator("cpu").manual_seed(args.seed), **pipe_kwargs)
             id_fg_mask = id_spatial_kwargs["curr_fg_mask"]
@@ -281,7 +304,12 @@ if __name__ == "__main__":
             print("#" * 50)
             print("Generating frame images ...")
             for ind, prompt in enumerate(frm_prompts):    
-                set_text_len(pipe, bg_lens[1:][ind], real_lens[1:][ind])
+                set_text_spans(
+                    pipe,
+                    bg_lens[1:][ind],
+                    action_starts[1:][ind],
+                    real_lens[1:][ind],
+                )
                 pre_images, spatial_kwargs = pipe(
                     prompt, is_pre_run=True, generator = torch.Generator("cpu").manual_seed(args.seed), spatial_kwargs=spatial_kwargs, **pipe_kwargs) 
                 pre_images[0].save(f"{out_dir}/{ind}_pre.jpg")       

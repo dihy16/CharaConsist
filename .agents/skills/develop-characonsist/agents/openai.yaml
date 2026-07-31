@@ -1,0 +1,4 @@
+interface:
+  display_name: "Develop CharaConsist"
+  short_description: "Maintain CharaConsist inference and Colab runs"
+  default_prompt: "Use $develop-characonsist to implement and validate a CharaConsist change."

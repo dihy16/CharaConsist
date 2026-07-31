@@ -137,17 +137,26 @@ SOURCE_ARCHIVE="$WORK_DIR/characonsist-source.tar.gz"
 PROMPTS_ARCHIVE="$WORK_DIR/prompts.tar.gz"
 SESSION_CREATED=false
 RESULTS_DOWNLOADED=false
+PENDING_REMOTE_ARCHIVE=""
+PENDING_LOCAL_ARCHIVE=""
 
 cleanup() {
   local exit_code=$?
   rm -rf "$WORK_DIR"
   if [[ "$SESSION_CREATED" == true && "$KEEP_SESSION" != true ]]; then
-    if [[ "$RESULTS_DOWNLOADED" != true ]]; then
-      echo "Attempting to download any finalized results before cleanup..."
-      mkdir -p "$LOCAL_OUTPUT_DIR"
-      colab download -s "$SESSION_NAME" "$REMOTE_RESULTS" "$LOCAL_OUTPUT_DIR" \
-        || echo "Warning: could not download partial results during cleanup." >&2
+    if [[ -n "$PENDING_REMOTE_ARCHIVE" && -n "$PENDING_LOCAL_ARCHIVE" ]]; then
+      echo "Attempting to recover the pending finalized result archive..."
+      mkdir -p "$(dirname "$PENDING_LOCAL_ARCHIVE")" "$LOCAL_OUTPUT_DIR"
+      if colab download -s "$SESSION_NAME" "$PENDING_REMOTE_ARCHIVE" "$PENDING_LOCAL_ARCHIVE"; then
+        tar -xzf "$PENDING_LOCAL_ARCHIVE" -C "$LOCAL_OUTPUT_DIR" \
+          || echo "Warning: could not extract the recovered result archive." >&2
+      else
+        echo "Warning: could not download the pending result archive during cleanup." >&2
+      fi
     fi
+    mkdir -p "$LOCAL_OUTPUT_DIR"
+    colab download -s "$SESSION_NAME" "$REMOTE_RESULTS/batch-summary.json" "$LOCAL_OUTPUT_DIR/batch-summary.json" \
+      || echo "Warning: could not download the batch summary during cleanup." >&2
     echo "Stopping Colab session '$SESSION_NAME'..."
     colab stop -s "$SESSION_NAME" || echo "Warning: could not stop '$SESSION_NAME'; run: colab stop -s $SESSION_NAME" >&2
   elif [[ "$SESSION_CREATED" == true ]]; then
@@ -167,7 +176,7 @@ echo "  Attention masks: enabled"
 echo "  Colab command timeout: ${EXEC_TIMEOUT}s"
 
 # Upload only project source. Model weights stay at the supplied remote path.
-tar -C "$SCRIPT_DIR" -czf "$SOURCE_ARCHIVE" inference.py prompt_utils.py make_story_image.py run_colab_bootstrap.py run_colab_remote.py run_batch_inference.py requirements-colab.txt models
+tar -C "$SCRIPT_DIR" -czf "$SOURCE_ARCHIVE" inference.py prompt_utils.py point_visualization.py make_story_image.py run_colab_remote.py run_batch_inference.py run_colab_worker.py requirements-colab.txt models
 tar -C "$PROMPTS_FOLDER" -czf "$PROMPTS_ARCHIVE" .
 
 NEW_COMMAND=(colab new -s "$SESSION_NAME")
@@ -270,24 +279,102 @@ else
   exit 1
 fi
 
-# Let the bootstrap stream the remote runner's output and record its real exit
-# code. Keeping this logic in Python avoids fragile shell quoting around
-# generators and subprocess streams.
-colab_exec "import pathlib, runpy, sys; root=pathlib.Path('$REMOTE_ROOT'); sys.argv=['run_colab_bootstrap.py', '--root', str(root), '--model-path', '$MODEL_PATH', '--model-repo', '$MODEL_REPO', '--init-mode', '0']; runpy.run_path(str(root/'run_colab_bootstrap.py'), run_name='__main__')"
+encode_for_python() {
+  printf '%s' "$1" | base64 | tr -d '\n'
+}
 
-LOCAL_EXIT_CODE_FILE="$WORK_DIR/run-exit-code.txt"
-colab download -s "$SESSION_NAME" "$REMOTE_ROOT/run-exit-code.txt" "$LOCAL_EXIT_CODE_FILE"
-REMOTE_EXIT_CODE="$(tr -d '[:space:]' < "$LOCAL_EXIT_CODE_FILE")"
+download_prompt_archive() {
+  local relative_output="$1"
+  local remote_archive="$REMOTE_ROOT/result_archives/$relative_output.tar.gz"
+  local local_archive="$WORK_DIR/result_archives/$relative_output.tar.gz"
+  mkdir -p "$(dirname "$local_archive")" "$LOCAL_OUTPUT_DIR"
+  PENDING_REMOTE_ARCHIVE="$remote_archive"
+  PENDING_LOCAL_ARCHIVE="$local_archive"
+  if colab download -s "$SESSION_NAME" "$remote_archive" "$local_archive"; then
+    if tar -xzf "$local_archive" -C "$LOCAL_OUTPUT_DIR"; then
+      RESULTS_DOWNLOADED=true
+      PENDING_REMOTE_ARCHIVE=""
+      PENDING_LOCAL_ARCHIVE=""
+      echo "Finalized result downloaded to: $LOCAL_OUTPUT_DIR/bg_fg/$relative_output"
+      return 0
+    fi
+    echo "Warning: could not extract finalized result archive" >&2
+    return 1
+  fi
+  echo "Warning: could not download finalized result archive" >&2
+  return 1
+}
 
-mkdir -p "$LOCAL_OUTPUT_DIR"
-if colab download -s "$SESSION_NAME" "$REMOTE_RESULTS" "$LOCAL_OUTPUT_DIR"; then
-  RESULTS_DOWNLOADED=true
-  echo "Results downloaded to: $LOCAL_OUTPUT_DIR"
-else
-  echo "Warning: no remote results could be downloaded" >&2
-fi
+download_remote_summary() {
+  mkdir -p "$LOCAL_OUTPUT_DIR"
+  colab download -s "$SESSION_NAME" "$REMOTE_RESULTS/batch-summary.json" "$LOCAL_OUTPUT_DIR/batch-summary.json"
+}
 
-if [[ "$REMOTE_EXIT_CODE" != 0 ]]; then
-  echo "Error: remote setup or one or more prompt files failed (exit code $REMOTE_EXIT_CODE)" >&2
-  exit "$REMOTE_EXIT_CODE"
+local_result_is_current() {
+  PYTHONPATH="$SCRIPT_DIR" python3 - "$1" "$2" "$MODEL_PATH" <<'PY'
+import sys
+from pathlib import Path
+from run_batch_inference import inference_settings, marker_matches, success_record
+import argparse
+
+prompt, output, model_path = map(Path, sys.argv[1:])
+config = argparse.Namespace(model_path=str(model_path), init_mode=0, gpu_ids=[0], save_mask=True, save_points=True, height=1024, width=1024, seed=2025)
+raise SystemExit(0 if marker_matches(output, success_record(prompt, inference_settings(config))) else 1)
+PY
+}
+
+ROOT_B64="$(encode_for_python "$REMOTE_ROOT")"
+MODEL_B64="$(encode_for_python "$MODEL_PATH")"
+REPO_B64="$(encode_for_python "$MODEL_REPO")"
+echo "Initializing one persistent Colab inference worker..."
+colab_exec "import base64, sys; root=base64.b64decode('$ROOT_B64').decode(); sys.path.insert(0, root); import run_colab_worker as worker; print('CHARACONSIST_WORKER_RESULT='+__import__('json').dumps(worker.start(root, base64.b64decode('$MODEL_B64').decode(), base64.b64decode('$REPO_B64').decode(), 0)))"
+
+REMOTE_FAILURES=0
+while IFS= read -r -d '' prompt_file; do
+  relative_prompt="${prompt_file#"$PROMPTS_FOLDER"/}"
+  relative_output="${relative_prompt%.txt}"
+  local_output="$LOCAL_OUTPUT_DIR/bg_fg/$relative_output"
+  relative_b64="$(encode_for_python "$relative_prompt")"
+
+  if local_result_is_current "$prompt_file" "$local_output"; then
+    echo "Skipping locally verified result: $relative_prompt"
+    colab_exec "import base64, json, run_colab_worker as worker; print('CHARACONSIST_PROMPT_RESULT='+json.dumps(worker.record_local_skip(base64.b64decode('$relative_b64').decode())))"
+    continue
+  fi
+
+  echo "Running prompt file: $relative_prompt"
+  RESULTS_DOWNLOADED=false
+  PENDING_REMOTE_ARCHIVE="$REMOTE_ROOT/result_archives/$relative_output.tar.gz"
+  PENDING_LOCAL_ARCHIVE="$WORK_DIR/result_archives/$relative_output.tar.gz"
+  if ! worker_output="$(colab_exec "import base64, json, run_colab_worker as worker; print('CHARACONSIST_PROMPT_RESULT='+json.dumps(worker.run_one(base64.b64decode('$relative_b64').decode())))" 2>&1)"; then
+    printf '%s\n' "$worker_output" >&2
+    echo "Error: Colab worker became unavailable; finalized earlier results will be recovered during cleanup." >&2
+    exit 1
+  fi
+  printf '%s\n' "$worker_output"
+
+  if [[ "$worker_output" == *'"status": "success"'* || "$worker_output" == *'"status": "skipped"'* ]]; then
+    download_prompt_archive "$relative_output" || exit 1
+    if ! local_result_is_current "$prompt_file" "$local_output"; then
+      echo "Error: downloaded result for '$relative_prompt' did not pass marker verification." >&2
+      exit 1
+    fi
+    echo "Verified local result before continuing: $relative_prompt"
+  else
+    REMOTE_FAILURES=1
+    PENDING_REMOTE_ARCHIVE=""
+    PENDING_LOCAL_ARCHIVE=""
+    download_remote_summary || true
+    echo "Prompt file failed; continuing with the next file." >&2
+  fi
+done < <(find "$PROMPTS_FOLDER" -type f -name '*.txt' -print0 | sort -z)
+
+finish_output="$(colab_exec "import json, run_colab_worker as worker; print('CHARACONSIST_WORKER_RESULT='+json.dumps(worker.finish()))" 2>&1 || true)"
+printf '%s\n' "$finish_output"
+RESULTS_DOWNLOADED=false
+download_remote_summary || exit 1
+
+if [[ "$finish_output" != *'"failed": 0'* || "$REMOTE_FAILURES" != 0 ]]; then
+  echo "Error: one or more prompt files failed; finalized results were downloaded." >&2
+  exit 1
 fi

@@ -22,6 +22,7 @@ def build_parser():
     parser.add_argument("--summary", required=True)
     parser.add_argument("--gpu-ids", type=int, nargs="+", default=[0])
     parser.add_argument("--save-mask", action="store_true")
+    parser.add_argument("--save-points", action="store_true")
     parser.add_argument("--height", type=int, default=1024)
     parser.add_argument("--width", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=2025)
@@ -34,6 +35,7 @@ def inference_settings(args):
         "init_mode": args.init_mode,
         "gpu_ids": args.gpu_ids,
         "save_mask": args.save_mask,
+        "save_points": getattr(args, "save_points", False),
         "height": args.height,
         "width": args.width,
         "seed": args.seed,

@@ -14,6 +14,7 @@ parser.add_argument(
 )
 parser.add_argument("--share_bg", action='store_true')
 parser.add_argument("--save_mask", action='store_true')
+parser.add_argument("--save_points", action='store_true')
 parser.add_argument("--save_all_steps", action='store_true')
 parser.add_argument("--mix_mode", action='store_true')
 parser.add_argument("--height", type=int, default=1024)
@@ -31,6 +32,7 @@ from models.attention_processor_characonsist import (
 )
 from models.pipeline_characonsist import CharaConsistPipeline
 from prompt_utils import build_prompt_and_spans
+from point_visualization import save_dense_correspondence
 
 
 def configure_cuda(gpu_ids):
@@ -176,6 +178,18 @@ def visualize_argmax_indices(image, argmax_indices, output_path):
     out_img = out_img.astype(np.uint8)
     Image.fromarray(out_img).save(output_path)
 
+
+def snapshot_point_tracking(spatial_kwargs):
+    """Freeze the paper's unmodified pre-run correspondence before the final pass."""
+    required = ("argmax_indices", "max_sim", "id_fg_mask", "curr_fg_mask")
+    missing = [key for key in required if key not in spatial_kwargs]
+    if missing:
+        raise RuntimeError(f"Missing pre-run point-tracking tensors: {', '.join(missing)}")
+    return {
+        key: spatial_kwargs[key].detach().cpu().clone().numpy()
+        for key in required
+    }
+
 def run_prompt_file(pipe, args):
     pipe_kwargs = dict(
         height = args.height,
@@ -239,6 +253,7 @@ def run_prompt_file(pipe, args):
                 spatial_kwargs=spatial_kwargs,
                 **curr_pipe_kwargs,
             )
+            point_snapshot = snapshot_point_tracking(spatial_kwargs) if args.save_points else None
             pre_images[0].save(f"{args.out_dir}/{ind}_pre.jpg")
             images, spatial_kwargs = pipe(
                 prompt,
@@ -247,6 +262,14 @@ def run_prompt_file(pipe, args):
                 **curr_pipe_kwargs,
             )
             images[0].save(f"{args.out_dir}/{ind}.jpg")
+            if point_snapshot is not None:
+                points_out_dir = os.path.join(args.out_dir, "points")
+                save_dense_correspondence(
+                    images[0],
+                    point_snapshot,
+                    os.path.join(points_out_dir, f"{ind}_dense.jpg"),
+                    os.path.join(points_out_dir, f"{ind}_dense.json"),
+                )
             if args.save_mask:
                 overlay_mask_on_image(
                     images[0],
@@ -309,10 +332,19 @@ def run_prompt_file(pipe, args):
                 )
                 pre_images, spatial_kwargs = pipe(
                     prompt, is_pre_run=True, generator = torch.Generator("cpu").manual_seed(args.seed), spatial_kwargs=spatial_kwargs, **pipe_kwargs) 
+                point_snapshot = snapshot_point_tracking(spatial_kwargs) if args.save_points else None
                 pre_images[0].save(f"{out_dir}/{ind}_pre.jpg")       
                 images, spatial_kwargs = pipe(
                     prompt, generator = torch.Generator("cpu").manual_seed(args.seed), spatial_kwargs=spatial_kwargs, **pipe_kwargs)
                 images[0].save(f"{out_dir}/{ind}.jpg")
+                if point_snapshot is not None:
+                    points_out_dir = os.path.join(out_dir, "points")
+                    save_dense_correspondence(
+                        images[0],
+                        point_snapshot,
+                        os.path.join(points_out_dir, f"{ind}_dense.jpg"),
+                        os.path.join(points_out_dir, f"{ind}_dense.json"),
+                    )
                 if args.save_mask:
                     overlay_mask_on_image(images[0], spatial_kwargs["curr_fg_mask"][0].cpu().numpy(), (255, 0, 0), f"{mask_out_dir}/{ind}_mask.jpg")
                 if args.save_all_steps:

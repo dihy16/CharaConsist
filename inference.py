@@ -32,7 +32,7 @@ from models.attention_processor_characonsist import (
 )
 from models.pipeline_characonsist import CharaConsistPipeline
 from prompt_utils import build_prompt_and_spans
-from point_visualization import save_dense_correspondence
+from point_visualization import save_dense_correspondence, tensor_to_numpy
 
 
 def configure_cuda(gpu_ids):
@@ -186,7 +186,7 @@ def snapshot_point_tracking(spatial_kwargs):
     if missing:
         raise RuntimeError(f"Missing pre-run point-tracking tensors: {', '.join(missing)}")
     return {
-        key: spatial_kwargs[key].detach().cpu().clone().numpy()
+        key: tensor_to_numpy(spatial_kwargs[key])
         for key in required
     }
 

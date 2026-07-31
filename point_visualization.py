@@ -7,6 +7,14 @@ import numpy as np
 from PIL import Image
 
 
+def tensor_to_numpy(tensor):
+    """Copy a PyTorch tensor into a NumPy-compatible diagnostic snapshot."""
+    tensor = tensor.detach().cpu().clone()
+    if tensor.is_floating_point():
+        tensor = tensor.float()
+    return tensor.numpy()
+
+
 def build_dense_correspondence(argmax_indices, max_sim, id_fg_mask, curr_fg_mask, similarity_threshold=0.5):
     """Convert current-to-ID token matches into serializable records and colors."""
     indices = np.asarray(argmax_indices).reshape(-1).astype(np.int64)

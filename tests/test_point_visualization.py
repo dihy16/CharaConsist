@@ -4,9 +4,10 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import torch
 from PIL import Image
 
-from point_visualization import build_dense_correspondence, save_dense_correspondence
+from point_visualization import build_dense_correspondence, save_dense_correspondence, tensor_to_numpy
 
 
 class PointVisualizationTests(unittest.TestCase):
@@ -27,6 +28,15 @@ class PointVisualizationTests(unittest.TestCase):
         self.assertEqual(metadata["matches"][1]["current"], [1, 0])
         self.assertEqual(metadata["matches"][1]["identity"], [0, 1])
         self.assertEqual([item["valid"] for item in metadata["matches"]], [True, True, False, False])
+
+    def test_tensor_snapshot_casts_bfloat16_only_when_needed(self):
+        similarities = tensor_to_numpy(torch.tensor([0.5], dtype=torch.bfloat16))
+        indices = tensor_to_numpy(torch.tensor([3], dtype=torch.int64))
+        foreground = tensor_to_numpy(torch.tensor([True], dtype=torch.bool))
+
+        self.assertEqual(similarities.dtype, np.float32)
+        self.assertEqual(indices.dtype, np.int64)
+        self.assertEqual(foreground.dtype, np.bool_)
 
     def test_saved_comparison_uses_final_image_and_writes_json(self):
         with tempfile.TemporaryDirectory() as temp_dir:

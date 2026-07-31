@@ -66,6 +66,31 @@ def write_summary(path: Path, total, generated, skipped, failures):
     path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
 
 
+def merge_delivery_failures(summary, delivery_failures):
+    """Overlay local archive-delivery failures onto a remote batch summary."""
+    merged = dict(summary)
+    failures = list(summary.get("failed", []))
+    existing = {
+        (item.get("prompt_file"), item.get("source"), item.get("error"))
+        for item in failures
+        if isinstance(item, dict)
+    }
+    failed_prompts = set()
+    for failure in delivery_failures:
+        key = (failure.get("prompt_file"), failure.get("source"), failure.get("error"))
+        if key not in existing:
+            failures.append(failure)
+            existing.add(key)
+        if failure.get("prompt_file"):
+            failed_prompts.add(failure["prompt_file"])
+
+    failed_delivery_count = len(failed_prompts)
+    merged["failed"] = failures
+    merged["succeeded"] = max(0, int(summary.get("succeeded", 0)) - failed_delivery_count)
+    merged["generated"] = max(0, int(summary.get("generated", 0)) - failed_delivery_count)
+    return merged
+
+
 def main() -> int:
     args = build_parser().parse_args()
     root = Path(args.root)

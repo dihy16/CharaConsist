@@ -135,14 +135,15 @@ REMOTE_RESULTS="$REMOTE_ROOT/results"
 WORK_DIR="$(mktemp -d)"
 SOURCE_ARCHIVE="$WORK_DIR/characonsist-source.tar.gz"
 PROMPTS_ARCHIVE="$WORK_DIR/prompts.tar.gz"
+LOCAL_FAILURES_FILE="$WORK_DIR/local-result-delivery-failures.tsv"
 SESSION_CREATED=false
 RESULTS_DOWNLOADED=false
 PENDING_REMOTE_ARCHIVE=""
 PENDING_LOCAL_ARCHIVE=""
+: > "$LOCAL_FAILURES_FILE"
 
 cleanup() {
   local exit_code=$?
-  rm -rf "$WORK_DIR"
   if [[ "$SESSION_CREATED" == true && "$KEEP_SESSION" != true ]]; then
     if [[ -n "$PENDING_REMOTE_ARCHIVE" && -n "$PENDING_LOCAL_ARCHIVE" ]]; then
       echo "Attempting to recover the pending finalized result archive..."
@@ -154,14 +155,14 @@ cleanup() {
         echo "Warning: could not download the pending result archive during cleanup." >&2
       fi
     fi
-    mkdir -p "$LOCAL_OUTPUT_DIR"
-    colab download -s "$SESSION_NAME" "$REMOTE_RESULTS/batch-summary.json" "$LOCAL_OUTPUT_DIR/batch-summary.json" \
+    merge_remote_summary \
       || echo "Warning: could not download the batch summary during cleanup." >&2
     echo "Stopping Colab session '$SESSION_NAME'..."
     colab stop -s "$SESSION_NAME" || echo "Warning: could not stop '$SESSION_NAME'; run: colab stop -s $SESSION_NAME" >&2
   elif [[ "$SESSION_CREATED" == true ]]; then
     echo "Session '$SESSION_NAME' is still running (stop it with: colab stop -s $SESSION_NAME)"
   fi
+  rm -rf "$WORK_DIR"
   return "$exit_code"
 }
 trap cleanup EXIT
@@ -305,9 +306,43 @@ download_prompt_archive() {
   return 1
 }
 
-download_remote_summary() {
+record_local_failure() {
+  local relative_prompt="$1"
+  local reason="$2"
+  printf '%s\t%s\n' "$relative_prompt" "$reason" >> "$LOCAL_FAILURES_FILE"
+}
+
+merge_remote_summary() {
+  local remote_summary="$WORK_DIR/remote-batch-summary.json"
   mkdir -p "$LOCAL_OUTPUT_DIR"
-  colab download -s "$SESSION_NAME" "$REMOTE_RESULTS/batch-summary.json" "$LOCAL_OUTPUT_DIR/batch-summary.json"
+  if ! colab download -s "$SESSION_NAME" "$REMOTE_RESULTS/batch-summary.json" "$remote_summary"; then
+    return 1
+  fi
+  PYTHONPATH="$SCRIPT_DIR" python3 - "$remote_summary" "$LOCAL_FAILURES_FILE" "$LOCAL_OUTPUT_DIR/batch-summary.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from run_batch_inference import merge_delivery_failures
+
+remote_path, failures_path, destination = map(Path, sys.argv[1:])
+delivery_failures = []
+if failures_path.is_file():
+    for line in failures_path.read_text(encoding="utf-8").splitlines():
+        prompt_file, reason = line.split("\t", 1)
+        delivery_failures.append({
+            "prompt_file": prompt_file,
+            "exit_code": 1,
+            "source": "local_result_delivery",
+            "error": reason,
+        })
+
+summary = json.loads(remote_path.read_text(encoding="utf-8"))
+destination.write_text(
+    json.dumps(merge_delivery_failures(summary, delivery_failures), indent=2) + "\n",
+    encoding="utf-8",
+)
+PY
 }
 
 local_result_is_current() {
@@ -329,7 +364,7 @@ REPO_B64="$(encode_for_python "$MODEL_REPO")"
 echo "Initializing one persistent Colab inference worker..."
 colab_exec "import base64, sys; root=base64.b64decode('$ROOT_B64').decode(); sys.path.insert(0, root); import run_colab_worker as worker; print('CHARACONSIST_WORKER_RESULT='+__import__('json').dumps(worker.start(root, base64.b64decode('$MODEL_B64').decode(), base64.b64decode('$REPO_B64').decode(), 0)))"
 
-REMOTE_FAILURES=0
+BATCH_FAILURES=0
 while IFS= read -r -d '' prompt_file; do
   relative_prompt="${prompt_file#"$PROMPTS_FOLDER"/}"
   relative_output="${relative_prompt%.txt}"
@@ -354,17 +389,28 @@ while IFS= read -r -d '' prompt_file; do
   printf '%s\n' "$worker_output"
 
   if [[ "$worker_output" == *'"status": "success"'* || "$worker_output" == *'"status": "skipped"'* ]]; then
-    download_prompt_archive "$relative_output" || exit 1
-    if ! local_result_is_current "$prompt_file" "$local_output"; then
-      echo "Error: downloaded result for '$relative_prompt' did not pass marker verification." >&2
-      exit 1
+    if ! download_prompt_archive "$relative_output"; then
+      record_local_failure "$relative_prompt" "finalized result archive could not be downloaded or extracted"
+      BATCH_FAILURES=1
+      PENDING_REMOTE_ARCHIVE=""
+      PENDING_LOCAL_ARCHIVE=""
+      merge_remote_summary || true
+      echo "Result delivery failed for '$relative_prompt'; continuing so it can be retried next run." >&2
+    elif ! local_result_is_current "$prompt_file" "$local_output"; then
+      record_local_failure "$relative_prompt" "downloaded result did not pass marker verification for the current settings"
+      BATCH_FAILURES=1
+      PENDING_REMOTE_ARCHIVE=""
+      PENDING_LOCAL_ARCHIVE=""
+      merge_remote_summary || true
+      echo "Downloaded result for '$relative_prompt' is retained but marked bad; continuing so it can be retried next run." >&2
+    else
+      echo "Verified local result before continuing: $relative_prompt"
     fi
-    echo "Verified local result before continuing: $relative_prompt"
   else
-    REMOTE_FAILURES=1
+    BATCH_FAILURES=1
     PENDING_REMOTE_ARCHIVE=""
     PENDING_LOCAL_ARCHIVE=""
-    download_remote_summary || true
+    merge_remote_summary || true
     echo "Prompt file failed; continuing with the next file." >&2
   fi
 done < <(find "$PROMPTS_FOLDER" -type f -name '*.txt' -print0 | sort -z)
@@ -372,9 +418,9 @@ done < <(find "$PROMPTS_FOLDER" -type f -name '*.txt' -print0 | sort -z)
 finish_output="$(colab_exec "import json, run_colab_worker as worker; print('CHARACONSIST_WORKER_RESULT='+json.dumps(worker.finish()))" 2>&1 || true)"
 printf '%s\n' "$finish_output"
 RESULTS_DOWNLOADED=false
-download_remote_summary || exit 1
+merge_remote_summary || exit 1
 
-if [[ "$finish_output" != *'"failed": 0'* || "$REMOTE_FAILURES" != 0 ]]; then
-  echo "Error: one or more prompt files failed; finalized results were downloaded." >&2
+if [[ "$finish_output" != *'"failed": 0'* || "$BATCH_FAILURES" != 0 ]]; then
+  echo "Error: one or more prompt files or local result deliveries failed; valid results were downloaded." >&2
   exit 1
 fi

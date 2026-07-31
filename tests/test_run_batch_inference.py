@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from run_batch_inference import MARKER_NAME, marker_matches, success_record, write_summary
+from run_batch_inference import MARKER_NAME, marker_matches, merge_delivery_failures, success_record, write_summary
 
 
 class BatchInferenceTests(unittest.TestCase):
@@ -32,3 +32,17 @@ class BatchInferenceTests(unittest.TestCase):
             self.assertEqual(summary["skipped"], 1)
             self.assertEqual(summary["failed"], [{"prompt_file": "bad.txt"}])
 
+    def test_local_delivery_failure_makes_remote_success_retryable(self):
+        merged = merge_delivery_failures(
+            {"total": 3, "succeeded": 3, "generated": 3, "skipped": 0, "failed": []},
+            [{
+                "prompt_file": "scene.txt",
+                "exit_code": 1,
+                "source": "local_result_delivery",
+                "error": "downloaded result did not pass marker verification",
+            }],
+        )
+
+        self.assertEqual(merged["succeeded"], 2)
+        self.assertEqual(merged["generated"], 2)
+        self.assertEqual(merged["failed"][0]["prompt_file"], "scene.txt")

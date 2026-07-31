@@ -9,7 +9,7 @@
 #
 # Example:
 #   bash run_colab.sh prompts/stress_test my-session \
-#     --model-path /content/drive/MyDrive/models/flux-dev --gpu L4
+#     --model-path /content/drive/MyDrive/models/flux-dev --gpu A100
 
 set -euo pipefail
 
@@ -19,10 +19,9 @@ Usage: run_colab.sh <prompts_folder> [session_name] --model-path <remote_path> [
 
 Options:
   --session <name>       Session name (alternative to the optional positional name)
-  --gpu <T4|L4|A100|H100>
+  --gpu <A100|H100>      Required accelerator (mode 0 needs about 37 GB VRAM)
   --model-path <path>    Required path to FLUX.1-dev on the Colab VM
   --model-repo <repo>    Hugging Face fallback (default: black-forest-labs/FLUX.1-dev)
-  --init-mode <0|1|2|3>  inference.py initialization mode (default: 1, CPU offload)
   --timeout <seconds>    Timeout for dependency setup and inference (default: 7200)
   --output-dir <path>    Local directory for downloaded results (default: results_colab)
   --keep                 Leave the Colab session running after completion or failure
@@ -35,7 +34,6 @@ SESSION_NAME=""
 GPU=""
 MODEL_PATH=""
 MODEL_REPO="black-forest-labs/FLUX.1-dev"
-INIT_MODE=1
 EXEC_TIMEOUT=7200
 LOCAL_OUTPUT_DIR="results_colab"
 KEEP_SESSION=false
@@ -60,11 +58,6 @@ while [[ $# -gt 0 ]]; do
     --model-repo)
       [[ $# -ge 2 ]] || { echo "Error: --model-repo needs a value" >&2; exit 2; }
       MODEL_REPO="$2"
-      shift 2
-      ;;
-    --init-mode)
-      [[ $# -ge 2 ]] || { echo "Error: --init-mode needs a value" >&2; exit 2; }
-      INIT_MODE="$2"
       shift 2
       ;;
     --output-dir)
@@ -107,9 +100,9 @@ done
 
 [[ -n "$PROMPTS_FOLDER" ]] || { usage >&2; exit 2; }
 [[ -n "$MODEL_PATH" ]] || { echo "Error: --model-path is required" >&2; usage >&2; exit 2; }
-[[ "$INIT_MODE" =~ ^[0-3]$ ]] || { echo "Error: --init-mode must be 0, 1, 2, or 3" >&2; exit 2; }
 [[ "$EXEC_TIMEOUT" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "Error: --timeout must be a positive number of seconds" >&2; exit 2; }
-[[ -z "$GPU" || "$GPU" =~ ^(T4|L4|A100|H100)$ ]] || { echo "Error: unsupported GPU '$GPU'" >&2; exit 2; }
+[[ -n "$GPU" ]] || { echo "Error: --gpu is required; choose A100 or H100 for init mode 0" >&2; exit 2; }
+[[ "$GPU" =~ ^(A100|H100)$ ]] || { echo "Error: unsupported GPU '$GPU'; init mode 0 requires A100 or H100" >&2; exit 2; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -143,15 +136,24 @@ WORK_DIR="$(mktemp -d)"
 SOURCE_ARCHIVE="$WORK_DIR/characonsist-source.tar.gz"
 PROMPTS_ARCHIVE="$WORK_DIR/prompts.tar.gz"
 SESSION_CREATED=false
+RESULTS_DOWNLOADED=false
 
 cleanup() {
+  local exit_code=$?
   rm -rf "$WORK_DIR"
   if [[ "$SESSION_CREATED" == true && "$KEEP_SESSION" != true ]]; then
+    if [[ "$RESULTS_DOWNLOADED" != true ]]; then
+      echo "Attempting to download any finalized results before cleanup..."
+      mkdir -p "$LOCAL_OUTPUT_DIR"
+      colab download -s "$SESSION_NAME" "$REMOTE_RESULTS" "$LOCAL_OUTPUT_DIR" \
+        || echo "Warning: could not download partial results during cleanup." >&2
+    fi
     echo "Stopping Colab session '$SESSION_NAME'..."
     colab stop -s "$SESSION_NAME" || echo "Warning: could not stop '$SESSION_NAME'; run: colab stop -s $SESSION_NAME" >&2
   elif [[ "$SESSION_CREATED" == true ]]; then
     echo "Session '$SESSION_NAME' is still running (stop it with: colab stop -s $SESSION_NAME)"
   fi
+  return "$exit_code"
 }
 trap cleanup EXIT
 
@@ -160,11 +162,12 @@ echo "  Session: $SESSION_NAME"
 echo "  Prompts: $PROMPT_COUNT file(s) from $PROMPTS_FOLDER"
 echo "  Remote model: $MODEL_PATH"
 echo "  Model download fallback: $MODEL_REPO"
+echo "  Initialization mode: 0 (single GPU)"
 echo "  Attention masks: enabled"
 echo "  Colab command timeout: ${EXEC_TIMEOUT}s"
 
 # Upload only project source. Model weights stay at the supplied remote path.
-tar -C "$SCRIPT_DIR" -czf "$SOURCE_ARCHIVE" inference.py prompt_utils.py make_story_image.py run_colab_bootstrap.py run_colab_remote.py requirements-colab.txt models
+tar -C "$SCRIPT_DIR" -czf "$SOURCE_ARCHIVE" inference.py prompt_utils.py make_story_image.py run_colab_bootstrap.py run_colab_remote.py run_batch_inference.py requirements-colab.txt models
 tar -C "$PROMPTS_FOLDER" -czf "$PROMPTS_ARCHIVE" .
 
 NEW_COMMAND=(colab new -s "$SESSION_NAME")
@@ -200,27 +203,77 @@ wait_for_colab_kernel() {
 wait_for_colab_kernel
 
 # A Drive-backed model path is not visible in a fresh VM until Drive is
-# mounted. colab drivemount handles the required browser authorization flow.
+# mounted. `colab drivemount` is an interactive browser authorization flow;
+# its kernel WebSocket can occasionally disconnect after a successful VM
+# allocation. Retry on a fresh CLI connection before giving up the session.
+mount_google_drive() {
+  local attempt mount_output
+  for attempt in 1 2 3; do
+    echo "Mounting Google Drive for model path: $MODEL_PATH ($attempt/3)..."
+    echo "  If an authorization URL appears, open it, grant Drive access, then complete the CLI prompt."
+
+    # Do not capture this interactive command in command substitution.  That
+    # buffers the authorization URL and can detach its stdin, leaving the user
+    # unable to authorize Drive until the command fails.  Let the CLI inherit
+    # this terminal so its URL and any prompt are immediately usable.
+    if colab drivemount -s "$SESSION_NAME"; then
+      :
+    else
+      echo "Drive mount attempt $attempt failed (a transient Colab WebSocket disconnect is recoverable)." >&2
+    fi
+
+    # The CLI can exit zero even when the notebook cell reports an error, so
+    # use an explicit kernel marker rather than the process exit status.
+    mount_output="$(colab_exec "from pathlib import Path; print('CHARACONSIST_DRIVE_MOUNT_OK' if Path('/content/drive').is_dir() else 'CHARACONSIST_DRIVE_MOUNT_MISSING')" 2>&1 || true)"
+    printf '%s\n' "$mount_output"
+    if [[ "$mount_output" == *"CHARACONSIST_DRIVE_MOUNT_OK"* ]]; then
+      return 0
+    fi
+    echo "Drive mount is not reachable after attempt $attempt." >&2
+
+    if [[ "$attempt" -lt 3 ]]; then
+      echo "Retrying Drive mount in $((attempt * 5)) seconds without releasing '$SESSION_NAME'..."
+      sleep $((attempt * 5))
+    fi
+  done
+  echo "Error: Google Drive could not be mounted after 3 attempts. The session will be cleaned up." >&2
+  return 1
+}
+
 if [[ "$MODEL_PATH" == /content/drive/* ]]; then
-  echo "Mounting Google Drive for model path: $MODEL_PATH"
-  colab drivemount -s "$SESSION_NAME"
+  mount_google_drive
 fi
 
 colab upload -s "$SESSION_NAME" "$SOURCE_ARCHIVE" "$REMOTE_ROOT/source.tar.gz"
 colab upload -s "$SESSION_NAME" "$PROMPTS_ARCHIVE" "$REMOTE_ROOT/prompts.tar.gz"
 
-# Transfer the Hugging Face credential as a temporary file so it is not
-# embedded in Colab command history. The remote runner deletes it immediately.
-if [[ -n "${HF_TOKEN:-}" ]]; then
+# Extract source before checking whether the remote model requires recovery.
+colab_exec "import pathlib, subprocess; root=pathlib.Path('$REMOTE_ROOT'); subprocess.run(['tar', '-xzf', str(root/'source.tar.gz'), '-C', str(root)], check=True)"
+
+# Do not upload a Hugging Face token for a complete Drive snapshot. The CLI can
+# return zero for a failed cell, so select behavior from an explicit marker.
+MODEL_STATUS_OUTPUT="$(colab_exec "import pathlib, sys; root=pathlib.Path('$REMOTE_ROOT'); sys.path.insert(0, str(root)); from run_colab_remote import model_snapshot_complete; ready=model_snapshot_complete(pathlib.Path('$MODEL_PATH')); print(f'CHARACONSIST_MODEL_READY={int(ready)}')" 2>&1 || true)"
+printf '%s\n' "$MODEL_STATUS_OUTPUT"
+if [[ "$MODEL_STATUS_OUTPUT" == *"CHARACONSIST_MODEL_READY=1"* ]]; then
+  echo "Remote model snapshot is complete; Hugging Face fallback is not needed."
+elif [[ "$MODEL_STATUS_OUTPUT" == *"CHARACONSIST_MODEL_READY=0"* ]]; then
+  if [[ -z "${HF_TOKEN:-}" ]]; then
+    echo "Error: remote model snapshot is incomplete and HF_TOKEN is not configured." >&2
+    exit 1
+  fi
+  echo "Remote model snapshot is incomplete; uploading a temporary Hugging Face credential for recovery."
   LOCAL_HF_TOKEN_FILE="$WORK_DIR/hf-token"
   (umask 077 && printf '%s' "$HF_TOKEN" > "$LOCAL_HF_TOKEN_FILE")
   colab upload -s "$SESSION_NAME" "$LOCAL_HF_TOKEN_FILE" "$REMOTE_ROOT/.hf_token"
+else
+  echo "Error: could not determine whether the remote model snapshot is complete." >&2
+  exit 1
 fi
 
-# Extract the small Python bootstrap, then let it stream the remote runner's
-# output and record the real exit code. Keeping this logic in Python avoids
-# fragile shell quoting around generators and subprocess streams.
-colab_exec "import pathlib, runpy, subprocess, sys; root=pathlib.Path('$REMOTE_ROOT'); subprocess.run(['tar', '-xzf', str(root/'source.tar.gz'), '-C', str(root)], check=True); sys.argv=['run_colab_bootstrap.py', '--root', str(root), '--model-path', '$MODEL_PATH', '--model-repo', '$MODEL_REPO', '--init-mode', '$INIT_MODE']; runpy.run_path(str(root/'run_colab_bootstrap.py'), run_name='__main__')"
+# Let the bootstrap stream the remote runner's output and record its real exit
+# code. Keeping this logic in Python avoids fragile shell quoting around
+# generators and subprocess streams.
+colab_exec "import pathlib, runpy, sys; root=pathlib.Path('$REMOTE_ROOT'); sys.argv=['run_colab_bootstrap.py', '--root', str(root), '--model-path', '$MODEL_PATH', '--model-repo', '$MODEL_REPO', '--init-mode', '0']; runpy.run_path(str(root/'run_colab_bootstrap.py'), run_name='__main__')"
 
 LOCAL_EXIT_CODE_FILE="$WORK_DIR/run-exit-code.txt"
 colab download -s "$SESSION_NAME" "$REMOTE_ROOT/run-exit-code.txt" "$LOCAL_EXIT_CODE_FILE"
@@ -228,6 +281,7 @@ REMOTE_EXIT_CODE="$(tr -d '[:space:]' < "$LOCAL_EXIT_CODE_FILE")"
 
 mkdir -p "$LOCAL_OUTPUT_DIR"
 if colab download -s "$SESSION_NAME" "$REMOTE_RESULTS" "$LOCAL_OUTPUT_DIR"; then
+  RESULTS_DOWNLOADED=true
   echo "Results downloaded to: $LOCAL_OUTPUT_DIR"
 else
   echo "Warning: no remote results could be downloaded" >&2

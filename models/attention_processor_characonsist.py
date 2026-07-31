@@ -42,9 +42,15 @@ class FluxAttnProcessor2_0:
         bg_inter_img_attn: bool = False,
         attn_out_interpolate: bool = False,
         interpolate_weight_dict: dict = dict(),
+        action_gate_strength: float = 1.0,
         spatial_kwargs: Optional[dict] = None,
         **kwargs,
     ) -> torch.FloatTensor:
+        # This processor handles ordinary double-stream FLUX blocks, where
+        # action gating is intentionally not applied. Naming the shared kwarg
+        # prevents Diffusers from warning when it routes the same attention
+        # kwargs to every processor.
+        _ = action_gate_strength
         batch_size, _, _ = hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
 
         # `sample` projections.

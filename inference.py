@@ -19,10 +19,7 @@ parser.add_argument("--mix_mode", action='store_true')
 parser.add_argument("--height", type=int, default=1024)
 parser.add_argument("--width", type=int, default=1024)
 parser.add_argument("--seed", type=int, default=2025)
-args = parser.parse_args()
-
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(map(str, args.gpu_ids))
 import torch
 import numpy as np
 
@@ -36,33 +33,37 @@ from models.pipeline_characonsist import CharaConsistPipeline
 from prompt_utils import build_prompt_and_spans
 
 
-def init_model_mode_0():
-    pipe = CharaConsistPipeline.from_pretrained(args.model_path, torch_dtype=torch.bfloat16)
+def configure_cuda(gpu_ids):
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_ids))
+
+
+def init_model_mode_0(config):
+    pipe = CharaConsistPipeline.from_pretrained(config.model_path, torch_dtype=torch.bfloat16)
     pipe.to("cuda:0")
     return pipe
 
-def init_model_mode_1():
-    pipe = CharaConsistPipeline.from_pretrained(args.model_path, torch_dtype=torch.bfloat16)
+def init_model_mode_1(config):
+    pipe = CharaConsistPipeline.from_pretrained(config.model_path, torch_dtype=torch.bfloat16)
     pipe.enable_model_cpu_offload()
     return pipe
 
-def init_model_mode_2():
+def init_model_mode_2(config):
     from diffusers import FluxTransformer2DModel
     from transformers import T5EncoderModel
     transformer = FluxTransformer2DModel.from_pretrained(
-        args.model_path, subfolder="transformer", torch_dtype=torch.bfloat16, device_map="balanced")
+        config.model_path, subfolder="transformer", torch_dtype=torch.bfloat16, device_map="balanced")
     text_encoder_2 = T5EncoderModel.from_pretrained(
-        args.model_path, subfolder="text_encoder_2", torch_dtype=torch.bfloat16, device_map="balanced")
+        config.model_path, subfolder="text_encoder_2", torch_dtype=torch.bfloat16, device_map="balanced")
     pipe = CharaConsistPipeline.from_pretrained(
-        args.model_path, 
+        config.model_path,
         transformer=transformer,
         text_encoder_2=text_encoder_2,
         torch_dtype=torch.bfloat16, 
         device_map="balanced")
     return pipe
 
-def init_model_mode_3():
-    pipe = CharaConsistPipeline.from_pretrained(args.model_path, torch_dtype=torch.bfloat16)
+def init_model_mode_3(config):
+    pipe = CharaConsistPipeline.from_pretrained(config.model_path, torch_dtype=torch.bfloat16)
     pipe.enable_sequential_cpu_offload()
     return pipe
 
@@ -175,11 +176,7 @@ def visualize_argmax_indices(image, argmax_indices, output_path):
     out_img = out_img.astype(np.uint8)
     Image.fromarray(out_img).save(output_path)
 
-if __name__ == "__main__":
-    # Model Init
-    pipe = MODEL_INIT_FUNCS[args.init_mode]()
-    reset_attn_processor(pipe, size=(args.height//16, args.width//16))
-    
+def run_prompt_file(pipe, args):
     pipe_kwargs = dict(
         height = args.height,
         width = args.width,
@@ -329,3 +326,31 @@ if __name__ == "__main__":
             reset_id_bank(pipe)
             if prompt_ind < len(all_prompt_scenes):
                 save_story_visualization(out_dir, all_prompt_scenes[prompt_ind])
+
+
+def initialize_pipeline(args):
+    configure_cuda(args.gpu_ids)
+    pipe = MODEL_INIT_FUNCS[args.init_mode](args)
+    reset_attn_processor(pipe, size=(args.height // 16, args.width // 16))
+    return pipe
+
+
+def reset_runtime_state(pipe, args):
+    """Discard per-file identity and attention state without reloading weights."""
+    reset_id_bank(pipe)
+    reset_attn_processor(pipe, size=(args.height // 16, args.width // 16))
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def main():
+    args = parser.parse_args()
+    pipe = initialize_pipeline(args)
+    try:
+        run_prompt_file(pipe, args)
+    finally:
+        reset_runtime_state(pipe, args)
+
+
+if __name__ == "__main__":
+    main()

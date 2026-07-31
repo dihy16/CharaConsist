@@ -28,6 +28,52 @@ def model_snapshot_complete(model_path: Path) -> bool:
     return True
 
 
+def download_model_snapshot(model_path: Path, model_repo: str, hf_token: str) -> None:
+    """Download a missing snapshot without passing a token through a CLI argv."""
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "huggingface_hub>=1.0,<2.0"],
+            check=True,
+        )
+        from huggingface_hub import snapshot_download
+
+    try:
+        snapshot_download(
+            repo_id=model_repo,
+            local_dir=str(model_path),
+            token=hf_token,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Hugging Face denied or failed the download of {model_repo}. "
+            "Confirm that the token has read access and that its owner has "
+            "accepted the model license on Hugging Face."
+        ) from exc
+
+
+def ensure_model_snapshot(model_path: Path, model_repo: str, hf_token: str | None) -> bool:
+    """Ensure a usable model snapshot exists; return whether it was downloaded."""
+    if model_snapshot_complete(model_path):
+        return False
+
+    if not hf_token:
+        raise RuntimeError(
+            f"Model snapshot is missing or incomplete: {model_path}. Set "
+            f"HF_TOKEN before running the wrapper so it can resume {model_repo}."
+        )
+
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Downloading {model_repo} to {model_path}...", flush=True)
+    download_model_snapshot(model_path, model_repo, hf_token)
+    if not model_snapshot_complete(model_path):
+        raise RuntimeError(
+            f"The download finished but the model snapshot is still incomplete: {model_path}"
+        )
+    return True
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
@@ -49,49 +95,7 @@ def main() -> int:
         hf_token = token_path.read_text(encoding="utf-8").strip()
         token_path.unlink()
 
-    model_is_ready = model_snapshot_complete(model_path)
-    # With a token available, always ask `hf download` to reconcile the local
-    # snapshot. It skips completed files and resumes missing/partial shards.
-    if hf_token or not model_is_ready:
-        if not hf_token:
-            raise RuntimeError(
-                f"Model snapshot is missing or incomplete: {model_path}. Set "
-                f"HF_TOKEN before running the wrapper so it can resume {args.model_repo}."
-            )
-        model_path.parent.mkdir(parents=True, exist_ok=True)
-        print(f"Downloading {args.model_repo} to {model_path}...", flush=True)
-        hf_cli = shutil.which("hf")
-        if not hf_cli:
-            # Install only the modern download CLI temporarily. The compatible
-            # inference package set is installed together after the download.
-            subprocess.run(
-                [sys.executable, "-m", "pip", "install", "huggingface_hub>=1.0,<2.0"],
-                check=True,
-            )
-            hf_cli = shutil.which("hf")
-        if not hf_cli:
-            raise RuntimeError("The Hugging Face 'hf' CLI was not installed correctly.")
-
-        try:
-            subprocess.run(
-                [hf_cli, "auth", "login", "--token", hf_token],
-                check=True,
-            )
-            subprocess.run(
-                [hf_cli, "download", args.model_repo, "--local-dir", str(model_path)],
-                check=True,
-            )
-        except subprocess.CalledProcessError as exc:
-            raise RuntimeError(
-                f"Hugging Face denied or failed the download of {args.model_repo}. "
-                "Confirm that the token has read access and that its owner has "
-                "accepted the model license on Hugging Face."
-            ) from exc
-
-    if not model_snapshot_complete(model_path):
-        raise RuntimeError(
-            f"The download finished but the model snapshot is still incomplete: {model_path}"
-        )
+    ensure_model_snapshot(model_path, args.model_repo, hf_token)
 
     # Install the complete Hugging Face inference stack as a unit. Installing
     # only huggingface_hub can leave Colab's newer transformers incompatible
@@ -124,63 +128,21 @@ def main() -> int:
     if not prompt_files:
         raise RuntimeError(f"No .txt files found in {prompts_dir}")
 
-    failures = []
-    for index, prompt_file in enumerate(prompt_files, start=1):
-        relative_output = prompt_file.relative_to(prompts_dir).with_suffix("")
-        output_dir = root / "results" / "bg_fg" / relative_output
-        staging_dir = root / "results_in_progress" / relative_output
-        shutil.rmtree(staging_dir, ignore_errors=True)
-        print(f"[{index}/{len(prompt_files)}] Processing {prompt_file}", flush=True)
-        completed = subprocess.run(
-            [
-                sys.executable,
-                "inference.py",
-                "--init_mode",
-                args.init_mode,
-                "--prompts_file",
-                str(prompt_file),
-                "--model_path",
-                str(model_path),
-                "--out_dir",
-                str(staging_dir),
-                "--save_mask",
-            ],
-            cwd=root,
-            check=False,
-        )
-        if completed.returncode == 0:
-            output_dir.parent.mkdir(parents=True, exist_ok=True)
-            shutil.rmtree(output_dir, ignore_errors=True)
-            staging_dir.replace(output_dir)
-            print(f"[{index}/{len(prompt_files)}] Saved results for {prompt_file}", flush=True)
-        else:
-            shutil.rmtree(staging_dir, ignore_errors=True)
-            failures.append(
-                {
-                    "prompt_file": str(prompt_file.relative_to(prompts_dir)),
-                    "exit_code": completed.returncode,
-                }
-            )
-            print(
-                f"[{index}/{len(prompt_files)}] FAILED {prompt_file} "
-                f"(exit code {completed.returncode}); continuing",
-                file=sys.stderr,
-                flush=True,
-            )
-
-    summary = {
-        "total": len(prompt_files),
-        "succeeded": len(prompt_files) - len(failures),
-        "failed": failures,
-    }
-    summary_path = root / "results" / "batch-summary.json"
-    summary_path.parent.mkdir(parents=True, exist_ok=True)
-    summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
-    print(
-        f"Batch complete: {summary['succeeded']}/{summary['total']} prompt files succeeded",
-        flush=True,
-    )
-    return 1 if failures else 0
+    return subprocess.run(
+        [
+            sys.executable,
+            "run_batch_inference.py",
+            "--root", str(root),
+            "--prompts-dir", str(prompts_dir),
+            "--model-path", str(model_path),
+            "--init-mode", args.init_mode,
+            "--results-dir", str(root / "results" / "bg_fg"),
+            "--summary", str(root / "results" / "batch-summary.json"),
+            "--save-mask",
+        ],
+        cwd=root,
+        check=False,
+    ).returncode
 
 
 if __name__ == "__main__":

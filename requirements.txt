@@ -29,3 +29,4 @@ nvidia-nvtx-cu12==12.1.105
 opencv-python==4.13.0.92
 packaging==26.2
 pillow==11.3.0
+gradio==3.36.1

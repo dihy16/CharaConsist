@@ -151,3 +151,4 @@ cython_debug/
 # results & visualization
 results*
 visualize*
+!point_and_mask/visualize_gr.py

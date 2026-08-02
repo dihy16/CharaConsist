@@ -15,6 +15,7 @@ parser.add_argument(
 parser.add_argument("--share_bg", action='store_true')
 parser.add_argument("--save_mask", action='store_true')
 parser.add_argument("--save_points", action='store_true')
+parser.add_argument("--save_action_maps", action='store_true')
 parser.add_argument("--save_all_steps", action='store_true')
 parser.add_argument("--mix_mode", action='store_true')
 parser.add_argument("--height", type=int, default=1024)
@@ -33,6 +34,7 @@ from models.attention_processor_characonsist import (
 from models.pipeline_characonsist import CharaConsistPipeline
 from prompt_utils import build_prompt_and_spans
 from point_visualization import save_dense_correspondence, tensor_to_numpy
+from action_visualization import save_action_attention_artifacts
 
 
 def configure_cuda(gpu_ids):
@@ -190,6 +192,18 @@ def snapshot_point_tracking(spatial_kwargs):
         for key in required
     }
 
+
+def save_action_map(image, spatial_kwargs, output_dir, stem):
+    """Export the normalized foreground-masked action scores from step 10."""
+    if "action_scores" not in spatial_kwargs:
+        raise RuntimeError("Missing action_scores required for action-map export.")
+    save_action_attention_artifacts(
+        image,
+        spatial_kwargs["action_scores"],
+        output_dir,
+        stem,
+    )
+
 def run_prompt_file(pipe, args):
     pipe_kwargs = dict(
         height = args.height,
@@ -223,6 +237,10 @@ def run_prompt_file(pipe, args):
         )
         id_fg_mask = id_spatial_kwargs["curr_fg_mask"]
         id_images[0].save(f"{args.out_dir}/id.jpg")
+        if getattr(args, "save_action_maps", False):
+            save_action_map(
+                id_images[0], id_spatial_kwargs, os.path.join(args.out_dir, "action_attention"), "id"
+            )
         if args.save_mask:
             overlay_mask_on_image(
                 id_images[0], id_fg_mask[0].cpu().numpy(), (255, 0, 0), f"{mask_out_dir}/id_mask.jpg"
@@ -262,6 +280,10 @@ def run_prompt_file(pipe, args):
                 **curr_pipe_kwargs,
             )
             images[0].save(f"{args.out_dir}/{ind}.jpg")
+            if getattr(args, "save_action_maps", False):
+                save_action_map(
+                    images[0], spatial_kwargs, os.path.join(args.out_dir, "action_attention"), str(ind)
+                )
             if point_snapshot is not None:
                 points_out_dir = os.path.join(args.out_dir, "points")
                 save_dense_correspondence(
@@ -312,6 +334,10 @@ def run_prompt_file(pipe, args):
                 id_prompt, is_id=True, generator = torch.Generator("cpu").manual_seed(args.seed), **pipe_kwargs)
             id_fg_mask = id_spatial_kwargs["curr_fg_mask"]
             id_images[0].save(f"{out_dir}/id.jpg")
+            if getattr(args, "save_action_maps", False):
+                save_action_map(
+                    id_images[0], id_spatial_kwargs, os.path.join(out_dir, "action_attention"), "id"
+                )
             if args.save_mask:
                 overlay_mask_on_image(id_images[0], id_fg_mask[0].cpu().numpy(), (255, 0, 0), f"{mask_out_dir}/id_mask.jpg")
                 if args.save_all_steps and "all_fg_masks" in id_spatial_kwargs:
@@ -337,6 +363,10 @@ def run_prompt_file(pipe, args):
                 images, spatial_kwargs = pipe(
                     prompt, generator = torch.Generator("cpu").manual_seed(args.seed), spatial_kwargs=spatial_kwargs, **pipe_kwargs)
                 images[0].save(f"{out_dir}/{ind}.jpg")
+                if getattr(args, "save_action_maps", False):
+                    save_action_map(
+                        images[0], spatial_kwargs, os.path.join(out_dir, "action_attention"), str(ind)
+                    )
                 if point_snapshot is not None:
                     points_out_dir = os.path.join(out_dir, "points")
                     save_dense_correspondence(

@@ -80,6 +80,7 @@ We provide a batch generation script in `inference.py`. Its functionality is ess
 - `action_gate_strength`: How strongly action-token attention suppresses adaptive identity merging in action-sensitive foreground regions. The range is `0` (original merge behavior) to `1` (full gating), with a default of `1`.
 - `share_bg`: Whether to preserve the background unchanged
 - `save_mask`: Whether to save the automatically extracted masks during the generation process for visualization
+- `save_action_maps`: Save each normalized action score as a raw NumPy array, heatmap, and generated-image overlay.
 
 Prompt lines use the existing three-part format:
 
@@ -111,6 +112,20 @@ python inference.py \
 --out_dir results/fg_only \
 --use_interpolate --save_mask
 ```
+
+Running the action-gating sweep on Colab:
+
+```bash
+./run_colab.sh prompts/stress_test characonsist-sweep-a100 \
+  --model-path /content/drive/MyDrive/Colab/models/FLUX.1-dev \
+  --gpu A100 --output-dir results_colab \
+  --action-gate-strengths 0,0.25,0.5,0.75,1 --seeds 2025
+```
+
+Sweep runs always enable adaptive token merging, so `lambda=0` is the original
+ungated CharaConsist merge baseline. Results are separated as
+`lambda_0p50/seed_2025/bg_fg/...`; each generated prompt group includes an
+`action_attention/` directory with `.npy`, heatmap, and overlay artifacts.
 
 ## BibTeX
 If you find CharaConsist useful for your research and applications, please cite using this BibTeX:

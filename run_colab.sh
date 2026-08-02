@@ -9,7 +9,8 @@
 #
 # Example:
 #   bash run_colab.sh prompts/stress_test my-session \
-#     --model-path /content/drive/MyDrive/models/flux-dev --gpu A100
+#     --model-path /content/drive/MyDrive/models/flux-dev --gpu A100 \
+#     --action-gate-strengths 0,0.25,0.5,0.75,1 --seeds 2025
 
 set -euo pipefail
 
@@ -24,6 +25,9 @@ Options:
   --model-repo <repo>    Hugging Face fallback (default: black-forest-labs/FLUX.1-dev)
   --timeout <seconds>    Timeout for dependency setup and inference (default: 7200)
   --output-dir <path>    Local directory for downloaded results (default: results_colab)
+  --action-gate-strengths <csv>
+                         Lambda sweep values (default: 0,0.25,0.5,0.75,1)
+  --seeds <csv>          Generation seeds (default: 2025)
   --keep                 Leave the Colab session running after completion or failure
   -h, --help             Show this help
 EOF
@@ -37,6 +41,8 @@ MODEL_REPO="black-forest-labs/FLUX.1-dev"
 EXEC_TIMEOUT=7200
 LOCAL_OUTPUT_DIR="results_colab"
 KEEP_SESSION=false
+ACTION_GATE_STRENGTHS="0,0.25,0.5,0.75,1"
+SEEDS="2025"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -68,6 +74,16 @@ while [[ $# -gt 0 ]]; do
     --timeout)
       [[ $# -ge 2 ]] || { echo "Error: --timeout needs a value" >&2; exit 2; }
       EXEC_TIMEOUT="$2"
+      shift 2
+      ;;
+    --action-gate-strengths)
+      [[ $# -ge 2 ]] || { echo "Error: --action-gate-strengths needs a value" >&2; exit 2; }
+      ACTION_GATE_STRENGTHS="$2"
+      shift 2
+      ;;
+    --seeds)
+      [[ $# -ge 2 ]] || { echo "Error: --seeds needs a value" >&2; exit 2; }
+      SEEDS="$2"
       shift 2
       ;;
     --keep)
@@ -105,6 +121,18 @@ done
 [[ "$GPU" =~ ^(A100|H100)$ ]] || { echo "Error: unsupported GPU '$GPU'; init mode 0 requires A100 or H100" >&2; exit 2; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if ! PYTHONPATH="$SCRIPT_DIR" python3 - "$ACTION_GATE_STRENGTHS" "$SEEDS" <<'PY'
+import sys
+from sweep_utils import build_sweep_conditions
+
+conditions = build_sweep_conditions(sys.argv[1], sys.argv[2])
+print(f"Validated {len(conditions)} lambda/seed condition(s).")
+PY
+then
+  echo "Error: invalid lambda sweep configuration" >&2
+  exit 2
+fi
 
 # Prefer an already-exported token. Otherwise load the project's trusted .env
 # file so users do not need to export HF_TOKEN for every invocation.
@@ -174,10 +202,13 @@ echo "  Remote model: $MODEL_PATH"
 echo "  Model download fallback: $MODEL_REPO"
 echo "  Initialization mode: 0 (single GPU)"
 echo "  Attention masks: enabled"
+echo "  Action maps: enabled"
+echo "  Lambda values: $ACTION_GATE_STRENGTHS"
+echo "  Seeds: $SEEDS"
 echo "  Colab command timeout: ${EXEC_TIMEOUT}s"
 
 # Upload only project source. Model weights stay at the supplied remote path.
-tar -C "$SCRIPT_DIR" -czf "$SOURCE_ARCHIVE" inference.py prompt_utils.py point_visualization.py make_story_image.py run_colab_remote.py run_batch_inference.py run_colab_worker.py requirements-colab.txt models
+tar -C "$SCRIPT_DIR" -czf "$SOURCE_ARCHIVE" inference.py prompt_utils.py point_visualization.py action_visualization.py sweep_utils.py make_story_image.py run_colab_remote.py run_batch_inference.py run_colab_worker.py requirements-colab.txt models
 tar -C "$PROMPTS_FOLDER" -czf "$PROMPTS_ARCHIVE" .
 
 NEW_COMMAND=(colab new -s "$SESSION_NAME")
@@ -296,7 +327,7 @@ download_prompt_archive() {
       RESULTS_DOWNLOADED=true
       PENDING_REMOTE_ARCHIVE=""
       PENDING_LOCAL_ARCHIVE=""
-      echo "Finalized result downloaded to: $LOCAL_OUTPUT_DIR/bg_fg/$relative_output"
+      echo "Finalized result downloaded to: $LOCAL_OUTPUT_DIR/$relative_output"
       return 0
     fi
     echo "Warning: could not extract finalized result archive" >&2
@@ -329,9 +360,11 @@ remote_path, failures_path, destination = map(Path, sys.argv[1:])
 delivery_failures = []
 if failures_path.is_file():
     for line in failures_path.read_text(encoding="utf-8").splitlines():
-        prompt_file, reason = line.split("\t", 1)
+        task_path, reason = line.split("\t", 1)
+        path_parts = Path(task_path).parts
         delivery_failures.append({
-            "prompt_file": prompt_file,
+            "prompt_file": task_path,
+            "condition": "/".join(path_parts[:2]),
             "exit_code": 1,
             "source": "local_result_delivery",
             "error": reason,
@@ -346,14 +379,26 @@ PY
 }
 
 local_result_is_current() {
-  PYTHONPATH="$SCRIPT_DIR" python3 - "$1" "$2" "$MODEL_PATH" <<'PY'
+  PYTHONPATH="$SCRIPT_DIR" python3 - "$1" "$2" "$MODEL_PATH" "$3" "$4" <<'PY'
 import sys
 from pathlib import Path
 from run_batch_inference import inference_settings, marker_matches, success_record
 import argparse
 
-prompt, output, model_path = map(Path, sys.argv[1:])
-config = argparse.Namespace(model_path=str(model_path), init_mode=0, gpu_ids=[0], save_mask=True, save_points=True, height=1024, width=1024, seed=2025)
+prompt, output, model_path = map(Path, sys.argv[1:4])
+config = argparse.Namespace(
+    model_path=str(model_path),
+    init_mode=0,
+    gpu_ids=[0],
+    save_mask=True,
+    save_points=True,
+    save_action_maps=True,
+    height=1024,
+    width=1024,
+    seed=int(sys.argv[5]),
+    use_interpolate=True,
+    action_gate_strength=float(sys.argv[4]),
+)
 raise SystemExit(0 if marker_matches(output, success_record(prompt, inference_settings(config))) else 1)
 PY
 }
@@ -361,59 +406,71 @@ PY
 ROOT_B64="$(encode_for_python "$REMOTE_ROOT")"
 MODEL_B64="$(encode_for_python "$MODEL_PATH")"
 REPO_B64="$(encode_for_python "$MODEL_REPO")"
+STRENGTHS_B64="$(encode_for_python "$ACTION_GATE_STRENGTHS")"
+SEEDS_B64="$(encode_for_python "$SEEDS")"
 echo "Initializing one persistent Colab inference worker..."
-colab_exec "import base64, sys; root=base64.b64decode('$ROOT_B64').decode(); sys.path.insert(0, root); import run_colab_worker as worker; print('CHARACONSIST_WORKER_RESULT='+__import__('json').dumps(worker.start(root, base64.b64decode('$MODEL_B64').decode(), base64.b64decode('$REPO_B64').decode(), 0)))"
+colab_exec "import base64, sys; root=base64.b64decode('$ROOT_B64').decode(); sys.path.insert(0, root); import run_colab_worker as worker; print('CHARACONSIST_WORKER_RESULT='+__import__('json').dumps(worker.start(root, base64.b64decode('$MODEL_B64').decode(), base64.b64decode('$REPO_B64').decode(), 0, base64.b64decode('$STRENGTHS_B64').decode(), base64.b64decode('$SEEDS_B64').decode())))"
 
 BATCH_FAILURES=0
-while IFS= read -r -d '' prompt_file; do
-  relative_prompt="${prompt_file#"$PROMPTS_FOLDER"/}"
-  relative_output="${relative_prompt%.txt}"
-  local_output="$LOCAL_OUTPUT_DIR/bg_fg/$relative_output"
-  relative_b64="$(encode_for_python "$relative_prompt")"
+while IFS=$'\t' read -r action_gate_strength lambda_name seed; do
+  while IFS= read -r -d '' prompt_file; do
+    relative_prompt="${prompt_file#"$PROMPTS_FOLDER"/}"
+    prompt_output="${relative_prompt%.txt}"
+    relative_output="$lambda_name/seed_$seed/bg_fg/$prompt_output"
+    local_output="$LOCAL_OUTPUT_DIR/$relative_output"
+    relative_b64="$(encode_for_python "$relative_prompt")"
 
-  if local_result_is_current "$prompt_file" "$local_output"; then
-    echo "Skipping locally verified result: $relative_prompt"
-    colab_exec "import base64, json, run_colab_worker as worker; print('CHARACONSIST_PROMPT_RESULT='+json.dumps(worker.record_local_skip(base64.b64decode('$relative_b64').decode())))"
-    continue
-  fi
-
-  echo "Running prompt file: $relative_prompt"
-  RESULTS_DOWNLOADED=false
-  PENDING_REMOTE_ARCHIVE="$REMOTE_ROOT/result_archives/$relative_output.tar.gz"
-  PENDING_LOCAL_ARCHIVE="$WORK_DIR/result_archives/$relative_output.tar.gz"
-  if ! worker_output="$(colab_exec "import base64, json, run_colab_worker as worker; print('CHARACONSIST_PROMPT_RESULT='+json.dumps(worker.run_one(base64.b64decode('$relative_b64').decode())))" 2>&1)"; then
-    printf '%s\n' "$worker_output" >&2
-    echo "Error: Colab worker became unavailable; finalized earlier results will be recovered during cleanup." >&2
-    exit 1
-  fi
-  printf '%s\n' "$worker_output"
-
-  if [[ "$worker_output" == *'"status": "success"'* || "$worker_output" == *'"status": "skipped"'* ]]; then
-    if ! download_prompt_archive "$relative_output"; then
-      record_local_failure "$relative_prompt" "finalized result archive could not be downloaded or extracted"
-      BATCH_FAILURES=1
-      PENDING_REMOTE_ARCHIVE=""
-      PENDING_LOCAL_ARCHIVE=""
-      merge_remote_summary || true
-      echo "Result delivery failed for '$relative_prompt'; continuing so it can be retried next run." >&2
-    elif ! local_result_is_current "$prompt_file" "$local_output"; then
-      record_local_failure "$relative_prompt" "downloaded result did not pass marker verification for the current settings"
-      BATCH_FAILURES=1
-      PENDING_REMOTE_ARCHIVE=""
-      PENDING_LOCAL_ARCHIVE=""
-      merge_remote_summary || true
-      echo "Downloaded result for '$relative_prompt' is retained but marked bad; continuing so it can be retried next run." >&2
-    else
-      echo "Verified local result before continuing: $relative_prompt"
+    if local_result_is_current "$prompt_file" "$local_output" "$action_gate_strength" "$seed"; then
+      echo "Skipping locally verified result: $relative_output"
+      colab_exec "import base64, json, run_colab_worker as worker; print('CHARACONSIST_PROMPT_RESULT='+json.dumps(worker.record_local_skip(base64.b64decode('$relative_b64').decode(), $action_gate_strength, $seed)))"
+      continue
     fi
-  else
-    BATCH_FAILURES=1
-    PENDING_REMOTE_ARCHIVE=""
-    PENDING_LOCAL_ARCHIVE=""
-    merge_remote_summary || true
-    echo "Prompt file failed; continuing with the next file." >&2
-  fi
-done < <(find "$PROMPTS_FOLDER" -type f -name '*.txt' -print0 | sort -z)
+
+    echo "Running sweep task: $relative_output"
+    RESULTS_DOWNLOADED=false
+    PENDING_REMOTE_ARCHIVE="$REMOTE_ROOT/result_archives/$relative_output.tar.gz"
+    PENDING_LOCAL_ARCHIVE="$WORK_DIR/result_archives/$relative_output.tar.gz"
+    if ! worker_output="$(colab_exec "import base64, json, run_colab_worker as worker; print('CHARACONSIST_PROMPT_RESULT='+json.dumps(worker.run_one(base64.b64decode('$relative_b64').decode(), $action_gate_strength, $seed)))" 2>&1)"; then
+      printf '%s\n' "$worker_output" >&2
+      echo "Error: Colab worker became unavailable; finalized earlier results will be recovered during cleanup." >&2
+      exit 1
+    fi
+    printf '%s\n' "$worker_output"
+
+    if [[ "$worker_output" == *'"status": "success"'* || "$worker_output" == *'"status": "skipped"'* ]]; then
+      if ! download_prompt_archive "$relative_output"; then
+        record_local_failure "$relative_output" "finalized result archive could not be downloaded or extracted"
+        BATCH_FAILURES=1
+        PENDING_REMOTE_ARCHIVE=""
+        PENDING_LOCAL_ARCHIVE=""
+        merge_remote_summary || true
+        echo "Result delivery failed for '$relative_output'; continuing so it can be retried next run." >&2
+      elif ! local_result_is_current "$prompt_file" "$local_output" "$action_gate_strength" "$seed"; then
+        record_local_failure "$relative_output" "downloaded result did not pass marker verification for the current settings"
+        BATCH_FAILURES=1
+        PENDING_REMOTE_ARCHIVE=""
+        PENDING_LOCAL_ARCHIVE=""
+        merge_remote_summary || true
+        echo "Downloaded result for '$relative_output' is retained but marked bad; continuing so it can be retried next run." >&2
+      else
+        echo "Verified local result before continuing: $relative_output"
+      fi
+    else
+      BATCH_FAILURES=1
+      PENDING_REMOTE_ARCHIVE=""
+      PENDING_LOCAL_ARCHIVE=""
+      merge_remote_summary || true
+      echo "Sweep task failed; continuing with the next task." >&2
+    fi
+  done < <(find "$PROMPTS_FOLDER" -type f -name '*.txt' -print0 | sort -z)
+done < <(PYTHONPATH="$SCRIPT_DIR" python3 - "$ACTION_GATE_STRENGTHS" "$SEEDS" <<'PY'
+import sys
+from sweep_utils import build_sweep_conditions
+
+for condition in build_sweep_conditions(sys.argv[1], sys.argv[2]):
+    print(f"{condition.action_gate_strength}\t{condition.lambda_label}\t{condition.seed}")
+PY
+)
 
 finish_output="$(colab_exec "import json, run_colab_worker as worker; print('CHARACONSIST_WORKER_RESULT='+json.dumps(worker.finish()))" 2>&1 || true)"
 printf '%s\n' "$finish_output"

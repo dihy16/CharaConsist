@@ -134,9 +134,10 @@ python run_colab.py prompts/stress_test --session my-session --gpu L4 --keep
 ### Bash batch runner (Linux/macOS/WSL)
 ```bash
 bash run_colab.sh prompts/stress_test my-session \
-  --model-path /content/drive/MyDrive/models/flux-dev --gpu L4
+  --model-path /content/drive/MyDrive/models/flux-dev --gpu A100 \
+  --action-gate-strengths 0,0.25,0.5,0.75,1 --seeds 2025
 bash run_colab.sh prompts/stress_test my-session \
-  --model-path /content/drive/MyDrive/models/flux-dev --gpu L4 --keep
+  --model-path /content/drive/MyDrive/models/flux-dev --gpu A100 --keep
 ```
 
 `--model-path` is required and is a path **on the Colab VM**. The wrapper
@@ -153,7 +154,7 @@ token in the project's local `.env` file:
 ```bash
 echo 'HF_TOKEN=hf_your_read_token' >> .env
 ./run_colab.sh prompts/stress_test my-session \
-  --model-path /content/drive/MyDrive/models/flux-dev --gpu T4
+  --model-path /content/drive/MyDrive/models/flux-dev --gpu A100
 ```
 
 An already-exported `HF_TOKEN` takes precedence over `.env`. The token is
@@ -170,9 +171,10 @@ override it with `--timeout <seconds>` for larger batches.
    `/content/CharaConsist`
 3. **Install Colab-safe dependencies** without replacing Colab's preinstalled
    PyTorch, CUDA, or NCCL packages
-4. **Run inference** for every `.txt` file in that uploaded folder (including
-   nested folders), with `--save_mask` enabled
-5. **Download results** to `./results_colab`
+4. **Run inference** for every prompt, lambda, and seed with adaptive token
+   merge, masks, points, and action-map export enabled
+5. **Download results** to condition directories such as
+   `./results_colab/lambda_0p50/seed_2025/bg_fg/`
 6. **Cleanup** - stop session (unless `--keep` flag)
 
 ### Key Differences from Original

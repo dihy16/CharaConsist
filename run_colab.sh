@@ -41,7 +41,7 @@ MODEL_REPO="black-forest-labs/FLUX.1-dev"
 EXEC_TIMEOUT=7200
 LOCAL_OUTPUT_DIR="results_colab"
 KEEP_SESSION=false
-ACTION_GATE_STRENGTHS="0,0.25,0.5,0.75,1"
+ACTION_GATE_STRENGTHS="0,0.5,1"
 SEEDS="2025"
 
 while [[ $# -gt 0 ]]; do
@@ -202,13 +202,13 @@ echo "  Remote model: $MODEL_PATH"
 echo "  Model download fallback: $MODEL_REPO"
 echo "  Initialization mode: 0 (single GPU)"
 echo "  Attention masks: enabled"
-echo "  Action maps: enabled"
+echo "  Action and exact merge maps: enabled"
 echo "  Lambda values: $ACTION_GATE_STRENGTHS"
 echo "  Seeds: $SEEDS"
 echo "  Colab command timeout: ${EXEC_TIMEOUT}s"
 
 # Upload only project source. Model weights stay at the supplied remote path.
-tar -C "$SCRIPT_DIR" -czf "$SOURCE_ARCHIVE" inference.py prompt_utils.py point_visualization.py action_visualization.py sweep_utils.py make_story_image.py run_colab_remote.py run_batch_inference.py run_colab_worker.py requirements-colab.txt models
+tar -C "$SCRIPT_DIR" -czf "$SOURCE_ARCHIVE" inference.py prompt_utils.py point_visualization.py action_visualization.py merge_diagnostics.py sweep_utils.py make_story_image.py run_colab_remote.py run_batch_inference.py run_colab_worker.py requirements-colab.txt models
 tar -C "$PROMPTS_FOLDER" -czf "$PROMPTS_ARCHIVE" .
 
 NEW_COMMAND=(colab new -s "$SESSION_NAME")
@@ -393,8 +393,9 @@ config = argparse.Namespace(
     save_mask=True,
     save_points=True,
     save_action_maps=True,
-    height=1024,
-    width=1024,
+    save_merge_maps=True,
+    height=768,
+    width=768,
     seed=int(sys.argv[5]),
     use_interpolate=True,
     action_gate_strength=float(sys.argv[4]),
@@ -430,12 +431,13 @@ while IFS=$'\t' read -r action_gate_strength lambda_name seed; do
     RESULTS_DOWNLOADED=false
     PENDING_REMOTE_ARCHIVE="$REMOTE_ROOT/result_archives/$relative_output.tar.gz"
     PENDING_LOCAL_ARCHIVE="$WORK_DIR/result_archives/$relative_output.tar.gz"
-    if ! worker_output="$(colab_exec "import base64, json, run_colab_worker as worker; print('CHARACONSIST_PROMPT_RESULT='+json.dumps(worker.run_one(base64.b64decode('$relative_b64').decode(), $action_gate_strength, $seed)))" 2>&1)"; then
-      printf '%s\n' "$worker_output" >&2
+    worker_output_file="$WORK_DIR/worker-output.txt"
+    : > "$worker_output_file"
+    if ! colab_exec "import base64, json, run_colab_worker as worker; print('CHARACONSIST_PROMPT_RESULT='+json.dumps(worker.run_one(base64.b64decode('$relative_b64').decode(), $action_gate_strength, $seed)))" 2>&1 | tee "$worker_output_file"; then
       echo "Error: Colab worker became unavailable; finalized earlier results will be recovered during cleanup." >&2
       exit 1
     fi
-    printf '%s\n' "$worker_output"
+    worker_output="$(<"$worker_output_file")"
 
     if [[ "$worker_output" == *'"status": "success"'* || "$worker_output" == *'"status": "skipped"'* ]]; then
       if ! download_prompt_archive "$relative_output"; then

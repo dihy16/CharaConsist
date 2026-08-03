@@ -56,12 +56,13 @@ def inference_settings(args):
         "save_mask": args.save_mask,
         "save_points": getattr(args, "save_points", False),
         "save_action_maps": getattr(args, "save_action_maps", False),
+        "save_merge_maps": getattr(args, "save_merge_maps", False),
         "height": args.height,
         "width": args.width,
         "seed": args.seed,
         "use_interpolate": getattr(args, "use_interpolate", False),
         "action_gate_strength": getattr(args, "action_gate_strength", None),
-        "experiment_schema": 1,
+        "experiment_schema": 2,
     }
 
 
@@ -183,6 +184,7 @@ def main() -> int:
                 run_args.use_interpolate = True
                 run_args.action_gate_strength = condition.action_gate_strength
                 run_args.save_action_maps = True
+                run_args.save_merge_maps = True
                 run_args.share_bg = False
                 run_args.save_all_steps = False
                 run_args.mix_mode = False

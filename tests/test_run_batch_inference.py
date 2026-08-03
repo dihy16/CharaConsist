@@ -84,7 +84,13 @@ class BatchInferenceTests(unittest.TestCase):
 
         def run_prompt_file(_pipe, args):
             Path(args.out_dir).mkdir(parents=True, exist_ok=True)
-            calls.append((args.action_gate_strength, args.seed, args.use_interpolate, args.save_action_maps))
+            calls.append((
+                args.action_gate_strength,
+                args.seed,
+                args.use_interpolate,
+                args.save_action_maps,
+                args.save_merge_maps,
+            ))
 
         fake_inference = types.SimpleNamespace(
             initialize_pipeline=lambda _args: object(),
@@ -117,10 +123,10 @@ class BatchInferenceTests(unittest.TestCase):
             self.assertEqual(
                 calls,
                 [
-                    (0.0, 7, True, True),
-                    (0.0, 8, True, True),
-                    (0.5, 7, True, True),
-                    (0.5, 8, True, True),
+                    (0.0, 7, True, True, True),
+                    (0.0, 8, True, True, True),
+                    (0.5, 7, True, True, True),
+                    (0.5, 8, True, True, True),
                 ],
             )
             self.assertTrue(results.joinpath("lambda_0p50", "seed_8", "bg_fg", "scene", MARKER_NAME).is_file())

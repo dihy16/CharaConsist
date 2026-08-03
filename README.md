@@ -54,9 +54,9 @@ We provide two ways to use CharaConsist for generating consistent characters:
 
 #### (1) Notebook for Single Example
 We provide three Jupyter notebooks: 
-- `gen-bg_fg.ipynb`: generating consistent character in a fixed background, as shown in [Fig.1](#fig1).
-- `gen-fg_only.ipynb`: generating consistent character across different backgrounds, as shown in [Fig.2](#fig2).
-- `gen-mix.ipynb`: generating the same character in partly fixed and partly varying backgrounds, as shown in [Fig.3](#fig3).
+- `notebooks/gen-bg_fg.ipynb`: generating consistent character in a fixed background, as shown in [Fig.1](#fig1).
+- `notebooks/gen-fg_only.ipynb`: generating consistent character across different backgrounds, as shown in [Fig.2](#fig2).
+- `notebooks/gen-mix.ipynb`: generating the same character in partly fixed and partly varying backgrounds, as shown in [Fig.3](#fig3).
 
 Users can refer to the detailed descriptions in the notebooks to familiarize themselves with the entire framework of the method.
 
@@ -77,6 +77,10 @@ We provide a batch generation script in `inference.py`. Its functionality is ess
 - `model_path`: Path to the pre-trained [FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev) model weights.
 - `out_dir`: The path where the output results will be saved.
 - `use_interpolate`: Whether to use adaptive token merge. Enabling it improves consistency but increases CPU memory consumption.
+- `consistency_mode`: Component-ablation mode: `prompt_only` disables all
+  cross-image consistency, `attention_only` keeps identity attention but
+  disables adaptive token merge, and `full` enables both. Omit it to preserve
+  the legacy `use_interpolate` behavior.
 - `action_gate_strength`: How strongly action-token attention suppresses adaptive identity merging in action-sensitive foreground regions. The range is `0` (original merge behavior) to `1` (full gating), with a default of `1`.
 - `share_bg`: Whether to preserve the background unchanged
 - `save_mask`: Whether to save the automatically extracted masks during the generation process for visualization
@@ -121,6 +125,19 @@ Running the action-gating sweep on Colab:
   --gpu A100 --output-dir results_colab \
   --action-gate-strengths 0,0.25,0.5,0.75,1 --seeds 2025
 ```
+
+Running the seed-matched CharaConsist component ablation:
+
+```bash
+bash run_colab.sh /path/to/selected-prompts characonsist-components-a100 \
+  --model-path /content/drive/MyDrive/Colab/models/FLUX.1-dev \
+  --gpu A100 \
+  --consistency-modes prompt_only,attention_only,full \
+  --seeds 2025
+```
+
+Every mode in a component ablation uses lambda zero and writes a
+`component_trace.json` that verifies which consistency components executed.
 
 Sweep runs always enable adaptive token merging, so `lambda=0` is the original
 ungated CharaConsist merge baseline. Results are separated as

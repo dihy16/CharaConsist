@@ -1,10 +1,24 @@
+# Command Examples
+
+Run the stress-test batch:
+
+```bash
 ./run_colab.sh prompts/stress_test characonsist-stress-a100 --model-path /content/drive/MyDrive/Colab/models/FLUX.1-dev --gpu A100 --output-dir results_colab
+```
 
+Open the point-and-mask result viewer:
+
+```bash
 python point_and_mask/visualize_gr.py --run_dir results_colab/bg_fg/1a_anchor_verb/prompt_0
+```
 
+Run the historical action-gating lambda sweep:
+
+```bash
 ./run_colab.sh prompts/stress_test characonsist-sweep-a100 \
 --model-path /content/drive/MyDrive/Colab/models/FLUX.1-dev \
 --gpu A100 \
 --output-dir results_colab \
 --action-gate-strengths 0,0.5,1 \
 --seeds 2025
+```

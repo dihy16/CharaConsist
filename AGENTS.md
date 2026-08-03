@@ -28,9 +28,10 @@ control.
 
 ## Architecture
 
-- `inference.py` is the batch entrypoint and owns CLI parsing, model
-  initialization, identity/frame sequencing, and visual outputs.
-- `prompt_utils.py` builds the combined prompt and cumulative T5 span
+- `inference.py` is a compatibility CLI; implementation lives in
+  `characonsist/inference.py`, which owns model initialization,
+  identity/frame sequencing, and visual outputs.
+- `characonsist/prompts.py` builds the combined prompt and cumulative T5 span
   boundaries. Prompt records use `background#foreground#action` and may be
   truncated at 512 tokens.
 - `models/pipeline_characonsist.py` coordinates denoising and identity-bank
@@ -38,6 +39,9 @@ control.
   masks, point matching, and adaptive merging. Keep their shared kwargs and
   tensor shapes consistent.
 - `models/action_gating.py` contains pure, unit-testable action-gating helpers.
+- `characonsist/diagnostics/`, `characonsist/experiments/`,
+  `characonsist/runners/`, and `characonsist/visualization/` separate reusable
+  artifact logic, condition definitions, orchestration, and result rendering.
 - `run_colab.sh`, `run_colab_bootstrap.py`, and `run_colab_remote.py` are the
   supported Colab batch path. Do not extend the older `run_colab.py` unless a
   task explicitly targets it.
@@ -61,7 +65,7 @@ Run the narrowest relevant checks before broader ones:
 
 ```bash
 python -m unittest discover -s tests -v
-python -m py_compile inference.py prompt_utils.py run_colab_bootstrap.py run_colab_remote.py
+python -m py_compile inference.py characonsist/inference.py run_colab_bootstrap.py run_colab_remote.py
 bash -n run_colab.sh
 ```
 

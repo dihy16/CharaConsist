@@ -22,7 +22,7 @@ interface is a local batch-inference command, with optional Colab CLI wrappers.
 prompt .txt files
        |
        v
-inference.py  ------------------------>  results/<run>/
+inference.py -> characonsist.inference -> results/<run>/
   prompt parsing                              |- generated images
   run sequencing                              |- mask visualizations
   output serialization                         `- story.jpg (mix mode)
@@ -38,8 +38,14 @@ models.attention_processor_characonsist
        v
 Diffusers FluxPipeline + FLUX.1-dev weights + CUDA/PyTorch
 
-make_story_image.py
+characonsist.story
   prompt metadata + completed frames -> labeled story montage
+
+characonsist/
+  diagnostics/       saved masks, points, action maps, and trace audits
+  experiments/       reproducible sweep and ablation conditions
+  runners/           local batch and persistent Colab orchestration
+  visualization/     lambda and component comparison renderers
 
 point_and_mask/
   standalone mask-extraction and point-matching implementation
@@ -49,10 +55,11 @@ point_and_mask/
 
 | Entry point | Responsibility |
 | --- | --- |
-| `inference.py` | Main batch inference CLI. Loads FLUX weights, parses scene prompts, generates identity and follow-up images, and writes output artifacts. |
+| `inference.py` | Stable compatibility CLI for `characonsist.inference`. |
+| `characonsist/` | Packaged runtime, diagnostics, experiment conditions, runners, and visualization implementation. |
 | `run.sh` | Thin local shell loop over all `.txt` files in a prompt directory. |
 | `run_colab.py` / `run_colab.sh` | Experimental Colab CLI orchestration: create a session, upload prompts, invoke inference, and download results. |
-| `make_story_image.py` | Standalone and library-style story-montage generator. |
+| `make_story_image.py` | Stable CLI for the packaged story-montage generator. |
 | `point_and_mask/` | Independent version of the mask extraction and point matching logic for experimentation/visualization. |
 
 The runtime dependencies in `requirements.txt` center on PyTorch/CUDA,
@@ -155,7 +162,7 @@ It builds a boolean expanded-attention mask, converts blocked connections to
 functions at the end of the module install processors, set token lengths,
 aggregate masks/similarities, reset identity state, and update spatial size.
 
-### `inference.py`
+### `characonsist/inference.py`
 
 The inference runner is the application layer. In addition to argument parsing
 and model setup, it owns prompt-file parsing, deterministic per-call seeds,
@@ -163,7 +170,7 @@ the identity/pre-run/final-frame invocation sequence, and serialization of
 images and diagnostics. The `--save_mask` option saves rendered foreground
 mask overlays; it does not serialize raw attention-mask tensors.
 
-### `make_story_image.py`
+### `characonsist/story.py`
 
 This utility is isolated from diffusion inference. It parses the same prompt
 format, selects finished images (excluding `_pre` and existing story images),

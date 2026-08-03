@@ -4,7 +4,56 @@ Use this guide when you want to run the CharaConsist lambda sweep yourself, one
 step at a time, instead of invoking `run_colab.sh`. Commands below run from an
 Ubuntu or WSL terminal in the `CharaConsist` directory.
 
-## Recommended stress-test priority
+## Current component-attribution experiment
+
+The action gate changed internal merge weights and output pixels but did not
+produce a meaningful action-fidelity improvement. The next experiment isolates
+the original CharaConsist components using the same seed in every mode:
+
+1. `prompt_only`: prompt-conditioned FLUX frames with no identity sharing;
+2. `attention_only`: CharaConsist identity attention without adaptive merge;
+3. `full`: the unaltered CharaConsist baseline with adaptive merge and lambda 0.
+
+Start with `1a_anchor_verb.txt`, `1b_rare_verb.txt`, and
+`3b_prop_consistency.txt`. Avoid using `2b_transfer` or
+`3_large_pose_change` for this attribution because they contain separate
+entity-routing and correspondence/runtime confounds.
+
+To run only the three selected prompts automatically at matched seed 2025:
+
+```bash
+COMPONENT_PROMPTS="$(mktemp -d)"
+cp prompts/stress_test/{1a_anchor_verb,1b_rare_verb,3b_prop_consistency}.txt \
+  "$COMPONENT_PROMPTS/"
+
+bash run_colab.sh "$COMPONENT_PROMPTS" characonsist-components-a100 \
+  --model-path /content/drive/MyDrive/Colab/models/FLUX.1-dev \
+  --gpu A100 \
+  --consistency-modes prompt_only,attention_only,full \
+  --seeds 2025
+```
+
+Each mode receives seed 2025; mode is never substituted for or mixed with a
+seed. Results are written below
+`results_colab/component_ablation/<mode>/seed_2025/bg_fg/`.
+
+After downloading the three modes, render the matched comparisons:
+
+```bash
+for prompt in 1a_anchor_verb 1b_rare_verb 3b_prop_consistency; do
+  python compare_component_results.py \
+    --results-root results_colab \
+    --prompt-file "prompts/stress_test/$prompt.txt" \
+    --seed 2025
+done
+```
+
+Each image is saved to
+`results_colab/component_comparisons/<prompt>/seed_2025/outputs.jpg`. The same
+directory contains `comparison_audit.json`, while every generated prompt result
+contains `component_trace.json` proving which components ran.
+
+## Historical action-gating stress-test priority
 
 Run each prompt at both `lambda=0` and `lambda=1` with the same seed so the
 effect of action gating can be compared directly. Prioritize the prompts in
@@ -30,7 +79,7 @@ If compute is limited, start with `1a_anchor_verb.txt`,
 ```bash
 cd "/mnt/d/10 Personal/10.11 Projects/1HOIConsist/CharaConsist"
 
-SESSION="characonsist-manual-a100"
+SESSION="characonsist"
 MODEL_DRIVE="/content/drive/MyDrive/Colab/models/FLUX.1-dev"
 MODEL_PATH="/content/models/FLUX.1-dev"
 REMOTE_ROOT="/content/CharaConsist"
@@ -99,11 +148,10 @@ runner. The model is not included in these archives.
 
 ```bash
 WORK_DIR="$(mktemp -d)"
-tar -C . -czf "$WORK_DIR/source.tar.gz" \
-  inference.py prompt_utils.py point_visualization.py action_visualization.py \
-  merge_diagnostics.py \
-  sweep_utils.py make_story_image.py run_colab_remote.py run_batch_inference.py \
-  run_colab_worker.py requirements-colab.txt models
+tar --exclude='__pycache__' --exclude='*.pyc' -C . -czf "$WORK_DIR/source.tar.gz" \
+  inference.py make_story_image.py run_colab_remote.py run_batch_inference.py \
+  run_colab_worker.py compare_component_results.py visualize_lambda_results.py \
+  requirements-colab.txt characonsist models
 tar -C prompts/stress_test -czf "$WORK_DIR/prompts.tar.gz" .
 
 printf '%s\n' "from pathlib import Path; Path('$REMOTE_ROOT').mkdir(parents=True, exist_ok=True)" \

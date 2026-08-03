@@ -30,6 +30,8 @@ class CorrespondenceSession:
     similarity: np.ndarray
     valid: np.ndarray
     threshold: float
+    final_mask: Optional[Image.Image] = None
+    action_heatmap: Optional[Image.Image] = None
 
 
 def _as_grid(metadata, name):
@@ -170,7 +172,30 @@ def load_artifact_session(run_dir, frame):
     return CorrespondenceSession(
         identity, current, dense["identity_mask"], dense["current_mask"],
         dense["identity_x"], dense["identity_y"], dense["similarity"], dense["valid"], dense["threshold"],
+        load_final_mask(run_dir, frame, current.size),
+        load_action_heatmap(run_dir, frame),
     )
+
+
+def load_final_mask(run_dir, frame, image_size=None):
+    """Load the final-pass mask-only half of inference's saved visualization."""
+    path = Path(run_dir) / "mask" / f"{frame}_mask.jpg"
+    if not path.is_file():
+        return None
+    with Image.open(path) as saved_mask:
+        saved_mask = saved_mask.convert("RGB")
+        if image_size and saved_mask.size == (image_size[0] * 2, image_size[1]):
+            return saved_mask.crop((image_size[0], 0, image_size[0] * 2, image_size[1]))
+        return saved_mask.copy()
+
+
+def load_action_heatmap(run_dir, frame):
+    """Load an exported final-frame action heatmap when the run contains one."""
+    path = Path(run_dir) / "action_attention" / f"{frame}_heatmap.png"
+    if not path.is_file():
+        return None
+    with Image.open(path) as heatmap:
+        return heatmap.convert("RGB")
 
 
 def _prompt_and_lengths(pipe, background, foreground, action):
@@ -264,15 +289,19 @@ def build_app(pipe=None, run_dir=None):
         session_state = gr.State(value=None)
         with gr.Row():
             identity_image = gr.Image(label="The 1st image", type="pil")
-            identity_mask = gr.Image(label="1st foreground mask", type="pil")
+            identity_mask = gr.Image(label="ID foreground mask", type="pil")
             current_image = gr.Image(label="The 2nd image (click here)", type="pil", interactive=True)
-            current_mask = gr.Image(label="2nd foreground mask", type="pil")
+        with gr.Row():
+            current_mask = gr.Image(label="Pre-run correspondence mask", type="pil")
+            final_mask = gr.Image(label="Final-pass foreground mask", type="pil")
+            action_heatmap = gr.Image(label="Action-attention heatmap", type="pil")
         similarity = gr.Textbox(label="Similarity of clicked points pair", interactive=False)
 
         def present(session, status):
             return (
                 session, session.identity_image, _overlay_mask(session.identity_image, session.identity_mask),
-                session.current_image, _overlay_mask(session.current_image, session.current_mask), status,
+                session.current_image, _overlay_mask(session.current_image, session.current_mask),
+                session.final_mask, session.action_heatmap, status,
             )
 
         if pipe is not None:
@@ -300,10 +329,17 @@ def build_app(pipe=None, run_dir=None):
             generate.click(
                 generate_pair,
                 [first_background, first_foreground, first_action, second_background, second_foreground, second_action, seed],
-                [session_state, identity_image, identity_mask, current_image, current_mask, similarity],
+                [
+                    session_state, identity_image, identity_mask, current_image,
+                    current_mask, final_mask, action_heatmap, similarity,
+                ],
             )
         else:
-            gr.Markdown("### Saved run viewer\nCorrespondence was captured during the unmodified pre-run and is overlaid on the final saved frame.")
+            gr.Markdown(
+                "### Saved run viewer\n"
+                "Correspondence was captured during the unmodified pre-run and is overlaid on the final saved frame. "
+                "The final-mask or heatmap panel is blank when an older run did not save that artifact."
+            )
             frame_select = gr.Dropdown(choices=artifact_frames, value=artifact_frames[0], label="Frame")
 
             def load_frame(frame):
@@ -313,9 +349,22 @@ def build_app(pipe=None, run_dir=None):
                 except (RuntimeError, ValueError, OSError) as exc:
                     raise gr.Error(str(exc))
 
-            frame_select.change(load_frame, [frame_select], [session_state, identity_image, identity_mask, current_image, current_mask, similarity])
+            frame_select.change(
+                load_frame,
+                [frame_select],
+                [
+                    session_state, identity_image, identity_mask, current_image,
+                    current_mask, final_mask, action_heatmap, similarity,
+                ],
+            )
             initial = load_artifact_session(run_dir, artifact_frames[0])
-            app.load(lambda: present(initial, "Select a point in the 2nd image to inspect the saved correspondence."), outputs=[session_state, identity_image, identity_mask, current_image, current_mask, similarity])
+            app.load(
+                lambda: present(initial, "Select a point in the 2nd image to inspect the saved correspondence."),
+                outputs=[
+                    session_state, identity_image, identity_mask, current_image,
+                    current_mask, final_mask, action_heatmap, similarity,
+                ],
+            )
 
         def handle_click(session, event: gr.SelectData):
             x, y = event.index

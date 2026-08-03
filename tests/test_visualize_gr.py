@@ -9,7 +9,9 @@ from PIL import Image
 from point_and_mask.visualize_gr import (
     CorrespondenceSession,
     discover_artifact_frames,
+    load_action_heatmap,
     load_dense_correspondence,
+    load_final_mask,
     select_correspondence,
 )
 
@@ -66,6 +68,36 @@ class VisualizeGrTests(unittest.TestCase):
             (run_dir / "points" / "0_dense.json").write_text(json.dumps(dense_metadata()), encoding="utf-8")
             (run_dir / "points" / "1_dense.json").write_text(json.dumps(dense_metadata()), encoding="utf-8")
             self.assertEqual(discover_artifact_frames(run_dir), [0])
+
+    def test_action_heatmap_is_optional_for_saved_runs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            self.assertIsNone(load_action_heatmap(run_dir, 0))
+
+            action_dir = run_dir / "action_attention"
+            action_dir.mkdir()
+            Image.new("RGB", (6, 4), "red").save(action_dir / "0_heatmap.png")
+            heatmap = load_action_heatmap(run_dir, 0)
+
+        self.assertEqual(heatmap.size, (6, 4))
+
+    def test_final_mask_is_optional_and_extracts_mask_only_panel(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            self.assertIsNone(load_final_mask(run_dir, 0, (6, 4)))
+
+            mask_dir = run_dir / "mask"
+            mask_dir.mkdir()
+            comparison = Image.new("RGB", (12, 4), "blue")
+            comparison.paste(Image.new("RGB", (6, 4), "red"), (6, 0))
+            comparison.save(mask_dir / "0_mask.jpg", quality=100, subsampling=0)
+            final_mask = load_final_mask(run_dir, 0, (6, 4))
+
+        self.assertEqual(final_mask.size, (6, 4))
+        red, green, blue = final_mask.getpixel((2, 2))
+        self.assertGreater(red, 240)
+        self.assertLess(green, 15)
+        self.assertLess(blue, 15)
 
     def test_dense_loader_rejects_duplicate_current_coordinate(self):
         metadata = dense_metadata()

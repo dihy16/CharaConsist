@@ -151,4 +151,5 @@ cython_debug/
 # results & visualization
 results*
 visualize*
+!visualize_lambda_results.py
 !point_and_mask/visualize_gr.py

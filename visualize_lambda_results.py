@@ -245,6 +245,12 @@ def create_diagnostic_comparisons(results_root, prompt_file, output_path, seed=2
         raise ValueError(f"No lambda result directories found below {results_root}")
     rows = [(value, find_prompt_result(path, seed, prompt_file.stem, prompt_index)) for value, path in lambda_directories]
     base_path = output_path.with_suffix("")
+
+    def diagnostic_path(view, suffix=".jpg"):
+        """Use concise names for the default per-prompt output directory."""
+        if output_path.stem == "outputs":
+            return output_path.parent / f"{view}{suffix}"
+        return Path(f"{base_path}_{view}{suffix}")
     destinations = []
 
     if "outputs" in views:
@@ -274,7 +280,7 @@ def create_diagnostic_comparisons(results_root, prompt_file, output_path, seed=2
 
     for view in ("masks", "action_attention", "points"):
         if view in views:
-            destination = Path(f"{base_path}_{view}.jpg")
+            destination = diagnostic_path(view)
             destinations.append(_render_grid(prompt_file, prompt_parts, rows, f"{view.replace('_', ' ')} - seed {seed}", destination, artifact_provider(view), panel_size))
 
     merge_views = {
@@ -294,7 +300,7 @@ def create_diagnostic_comparisons(results_root, prompt_file, output_path, seed=2
             values = data[array_name]
             aggregate = values.mean(axis=0) if reduction == "mean" else values.max(axis=0)
             return _map_panel(aggregate, panel_size), f"{reduction} {array_name.replace('_', ' ')}"
-        destination = Path(f"{base_path}_{view}.jpg")
+        destination = diagnostic_path(view)
         destinations.append(_render_grid(prompt_file, prompt_parts, rows, f"{view.replace('_', ' ')} - seed {seed}", destination, provider, panel_size))
 
     if "merge_step_curves" in views:
@@ -303,7 +309,7 @@ def create_diagnostic_comparisons(results_root, prompt_file, output_path, seed=2
                 return None, ""
             data = _load_npz(result, column - 1)
             return (_curve_panel(data, panel_size), f"steps: {len(data['step_indices'])}") if data is not None else (None, "")
-        destination = Path(f"{base_path}_merge_step_curves.jpg")
+        destination = diagnostic_path("merge_step_curves")
         destinations.append(_render_grid(prompt_file, prompt_parts, rows, f"merge step curves - seed {seed}", destination, curve_provider, panel_size))
 
     successful = [(strength, result) for strength, result in rows if result is not None]
@@ -332,7 +338,7 @@ def create_diagnostic_comparisons(results_root, prompt_file, output_path, seed=2
             condition["frames"].append(metrics)
         comparison_audit["conditions"][lambda_label(strength)] = condition
 
-    audit_path = Path(f"{base_path}_comparison_audit.json")
+    audit_path = diagnostic_path("comparison_audit", ".json")
     audit_path.parent.mkdir(parents=True, exist_ok=True)
     audit_path.write_text(json.dumps(comparison_audit, indent=2) + "\n", encoding="utf-8")
 
@@ -346,7 +352,7 @@ def create_diagnostic_comparisons(results_root, prompt_file, output_path, seed=2
             scalar = np.clip(difference.mean(axis=2) / 255.0 * diff_gain, 0, 1)
             panel = Image.fromarray(colorize_action_scores(scalar), mode="RGB")
             return panel, f"vs lambda {reference_strength:g}; MAE {difference.mean():.3f}"
-        destination = Path(f"{base_path}_difference.jpg")
+        destination = diagnostic_path("difference")
         destinations.append(_render_grid(prompt_file, prompt_parts, rows, f"output difference x{diff_gain:g} - seed {seed}", destination, difference_provider, panel_size))
 
     if "audit" in views:
@@ -364,7 +370,7 @@ def create_diagnostic_comparisons(results_root, prompt_file, output_path, seed=2
             panel = _placeholder(panel_size, frame["status"])
             text = f"steps {frame['steps_recorded']} modified {frame['modified_token_applications']} max {frame['suppression_max']:.4f}"
             return panel, text
-        destination = Path(f"{base_path}_audit.jpg")
+        destination = diagnostic_path("audit")
         destinations.append(_render_grid(prompt_file, prompt_parts, rows, f"action gate audit - seed {seed}", destination, audit_provider, panel_size))
 
     return destinations, audit_path
@@ -390,7 +396,10 @@ def main():
     invalid = sorted(set(views) - set(DEFAULT_VIEWS))
     if invalid:
         parser.error(f"unknown views: {', '.join(invalid)}")
-    output = args.output or args.results_root / "comparisons" / f"{args.prompt_file.stem}_seed_{args.seed}.jpg"
+    output = args.output or (
+        args.results_root / "comparisons" / args.prompt_file.stem
+        / f"seed_{args.seed}" / "outputs.jpg"
+    )
     try:
         destinations, audit_path = create_diagnostic_comparisons(
             args.results_root, args.prompt_file, output, args.seed,

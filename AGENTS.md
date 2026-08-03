@@ -6,6 +6,26 @@ These instructions apply only to `CharaConsist/`. Treat the sibling `OneHOI/`
 tree as research context only: do not copy its trained modules, weights, or
 backbone into CharaConsist unless explicitly asked.
 
+## Research Objective
+
+CharaConsist is the baseline this repository is trying to improve upon. Work
+should first identify and reproduce a concrete baseline limitation, then test
+the smallest controlled change that targets it. Preserve a runnable unaltered
+baseline and use matched prompts, seeds, image sizes, model state, and schedules
+for comparisons.
+
+Do not treat a changed image as evidence of an improvement. Distinguish among:
+
+- implementation/mechanism validation (the new path executed as designed);
+- output sensitivity (the variant changed the generated pixels);
+- task improvement (identity, action, pose, interaction, or consistency became
+  measurably better than the CharaConsist baseline).
+
+Document negative and inconclusive findings, upstream failures, and prompts
+that are outside a variant's intended scope. Use these gaps to select the next
+hypothesis instead of escalating intervention strength without a causal
+control.
+
 ## Architecture
 
 - `inference.py` is the batch entrypoint and owns CLI parsing, model

@@ -245,16 +245,17 @@ python visualize_lambda_results.py \
   --seed 2025
 ```
 
-The generated-output comparison remains:
+Each prompt and seed now have their own comparison directory. The generated
+output comparison is:
 
 ```text
-results_colab/comparisons/3_large_pose_change_seed_2025.jpg
+results_colab/comparisons/3_large_pose_change/seed_2025/outputs.jpg
 ```
 
-Sibling files add masks, action-attention overlays, point tracking, exact mean
-effective merge weights, mean and maximum suppression, denoising-step curves,
-amplified output differences, and an audit dashboard. A machine-readable
-`*_comparison_audit.json` records pixel MAE and propagation status.
+The same directory contains `masks.jpg`, `action_attention.jpg`, `points.jpg`,
+exact mean effective merge weights, mean and maximum suppression,
+denoising-step curves, amplified output differences, and an audit dashboard.
+`comparison_audit.json` records pixel MAE and propagation status.
 
 Each successful remote prompt result also contains:
 

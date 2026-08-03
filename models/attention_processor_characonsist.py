@@ -13,7 +13,11 @@ from diffusers.models.attention_processor import Attention
 from diffusers.models.embeddings import apply_rotary_emb
 
 from tqdm import tqdm
-from .action_gating import action_gated_merge_weights, normalize_action_attention
+from .action_gating import (
+    action_gated_merge_weights,
+    build_merge_diagnostic_maps,
+    normalize_action_attention,
+)
 
 
 class FluxAttnProcessor2_0:
@@ -283,6 +287,27 @@ class CharaConsistAttnProcessor2_0:
             matched_action_scores,
             gate_strength=action_gate_strength,
         ).view(1, -1, 1)
+
+        merge_audit_state = kwargs.get("merge_audit_state")
+        if merge_audit_state is not None:
+            if action_scores is None or matched_action_scores is None:
+                raise RuntimeError("Merge auditing requires action scores.")
+            invocations = merge_audit_state.setdefault("invocations", {})
+            invocations[timestep_ind] = invocations.get(timestep_ind, 0) + 1
+            records = merge_audit_state.setdefault("records", {})
+            if timestep_ind not in records:
+                records[timestep_ind] = {
+                    "alpha": float(alpha),
+                    "maps": build_merge_diagnostic_maps(
+                        alpha,
+                        sim_weight,
+                        matched_action_scores,
+                        alpha_tensor,
+                        curr_fg_inds,
+                        action_scores.squeeze(0).shape,
+                        action_gate_strength,
+                    ),
+                }
 
         new_matched_curr_hidden_states = (1 - alpha_tensor) * matched_curr_hidden_states + alpha_tensor * matched_id_hidden_states
         vision_hidden_states[:, curr_fg_inds] = new_matched_curr_hidden_states

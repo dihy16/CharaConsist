@@ -16,6 +16,7 @@ parser.add_argument("--share_bg", action='store_true')
 parser.add_argument("--save_mask", action='store_true')
 parser.add_argument("--save_points", action='store_true')
 parser.add_argument("--save_action_maps", action='store_true')
+parser.add_argument("--save_merge_maps", action='store_true')
 parser.add_argument("--save_all_steps", action='store_true')
 parser.add_argument("--mix_mode", action='store_true')
 parser.add_argument("--height", type=int, default=1024)
@@ -35,6 +36,7 @@ from models.pipeline_characonsist import CharaConsistPipeline
 from prompt_utils import build_prompt_and_spans
 from point_visualization import save_dense_correspondence, tensor_to_numpy
 from action_visualization import save_action_attention_artifacts
+from merge_diagnostics import save_frame_merge_diagnostics, save_prompt_gate_audit
 
 
 def configure_cuda(gpu_ids):
@@ -204,6 +206,25 @@ def save_action_map(image, spatial_kwargs, output_dir, stem):
         stem,
     )
 
+
+def prepare_merge_audit(spatial_kwargs, args):
+    """Attach shared state that attention processors populate during a frame."""
+    if getattr(args, "save_merge_maps", False):
+        spatial_kwargs["merge_audit_state"] = {"records": {}, "invocations": {}}
+
+
+def finalize_merge_audit(spatial_kwargs, out_dir, frame, args):
+    """Serialize a frame audit and remove its transient shared state."""
+    if not getattr(args, "save_merge_maps", False):
+        return None
+    state = spatial_kwargs.pop("merge_audit_state", None)
+    return save_frame_merge_diagnostics(
+        state,
+        out_dir,
+        frame,
+        args.action_gate_strength,
+    )
+
 def run_prompt_file(pipe, args):
     pipe_kwargs = dict(
         height = args.height,
@@ -253,6 +274,7 @@ def run_prompt_file(pipe, args):
                     )
 
         spatial_kwargs = dict(id_fg_mask=id_fg_mask, id_bg_mask=~id_fg_mask)
+        frame_audits = []
         print("#" * 50)
         print("Generating frame images ...")
         for ind, prompt in enumerate(frm_prompts):
@@ -273,6 +295,7 @@ def run_prompt_file(pipe, args):
             )
             point_snapshot = snapshot_point_tracking(spatial_kwargs) if args.save_points else None
             pre_images[0].save(f"{args.out_dir}/{ind}_pre.jpg")
+            prepare_merge_audit(spatial_kwargs, args)
             images, spatial_kwargs = pipe(
                 prompt,
                 generator=torch.Generator("cpu").manual_seed(args.seed),
@@ -280,6 +303,9 @@ def run_prompt_file(pipe, args):
                 **curr_pipe_kwargs,
             )
             images[0].save(f"{args.out_dir}/{ind}.jpg")
+            frame_audit = finalize_merge_audit(spatial_kwargs, args.out_dir, ind, args)
+            if frame_audit is not None:
+                frame_audits.append(frame_audit)
             if getattr(args, "save_action_maps", False):
                 save_action_map(
                     images[0], spatial_kwargs, os.path.join(args.out_dir, "action_attention"), str(ind)
@@ -309,6 +335,13 @@ def run_prompt_file(pipe, args):
                 if "all_argmax_indices" in spatial_kwargs:
                     for step_i, indices_t in spatial_kwargs["all_argmax_indices"].items():
                         visualize_argmax_indices(images[0], indices_t, f"{mask_out_dir}/{ind}_all_steps/match_step_{step_i:02d}.jpg")
+        if getattr(args, "save_merge_maps", False):
+            save_prompt_gate_audit(
+                args.out_dir,
+                frame_audits,
+                args.action_gate_strength,
+                args.seed,
+            )
         reset_id_bank(pipe)
         mix_prompt_parts = [part for scene in parse_prompt_scenes(args.prompts_file) for part in scene]
         save_story_visualization(args.out_dir, mix_prompt_parts)
@@ -347,6 +380,7 @@ def run_prompt_file(pipe, args):
 
             # Frame Gen
             spatial_kwargs = dict(id_fg_mask = id_fg_mask, id_bg_mask = ~id_fg_mask)
+            frame_audits = []
             print("#" * 50)
             print("Generating frame images ...")
             for ind, prompt in enumerate(frm_prompts):    
@@ -360,9 +394,13 @@ def run_prompt_file(pipe, args):
                     prompt, is_pre_run=True, generator = torch.Generator("cpu").manual_seed(args.seed), spatial_kwargs=spatial_kwargs, **pipe_kwargs) 
                 point_snapshot = snapshot_point_tracking(spatial_kwargs) if args.save_points else None
                 pre_images[0].save(f"{out_dir}/{ind}_pre.jpg")       
+                prepare_merge_audit(spatial_kwargs, args)
                 images, spatial_kwargs = pipe(
                     prompt, generator = torch.Generator("cpu").manual_seed(args.seed), spatial_kwargs=spatial_kwargs, **pipe_kwargs)
                 images[0].save(f"{out_dir}/{ind}.jpg")
+                frame_audit = finalize_merge_audit(spatial_kwargs, out_dir, ind, args)
+                if frame_audit is not None:
+                    frame_audits.append(frame_audit)
                 if getattr(args, "save_action_maps", False):
                     save_action_map(
                         images[0], spatial_kwargs, os.path.join(out_dir, "action_attention"), str(ind)
@@ -385,6 +423,13 @@ def run_prompt_file(pipe, args):
                     if "all_argmax_indices" in spatial_kwargs:
                         for step_i, indices_t in spatial_kwargs["all_argmax_indices"].items():
                             visualize_argmax_indices(images[0], indices_t, f"{mask_out_dir}/{ind}_all_steps/match_step_{step_i:02d}.jpg")
+            if getattr(args, "save_merge_maps", False):
+                save_prompt_gate_audit(
+                    out_dir,
+                    frame_audits,
+                    args.action_gate_strength,
+                    args.seed,
+                )
             reset_id_bank(pipe)
             if prompt_ind < len(all_prompt_scenes):
                 save_story_visualization(out_dir, all_prompt_scenes[prompt_ind])

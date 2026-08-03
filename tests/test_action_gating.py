@@ -11,6 +11,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.action_gating import (  # noqa: E402
     action_gated_merge_weights,
+    build_merge_diagnostic_maps,
     normalize_action_attention,
 )
 from prompt_utils import build_prompt_and_spans  # noqa: E402
@@ -123,6 +124,40 @@ class ActionAttentionTests(unittest.TestCase):
                 torch.ones(1),
                 torch.zeros(1),
                 gate_strength=1.1,
+            )
+
+    def test_diagnostic_maps_capture_applied_suppression(self):
+        similarities = torch.tensor([0.5, 1.0])
+        action_scores = torch.tensor([0.0, 0.5])
+        effective = action_gated_merge_weights(
+            0.8, similarities, action_scores, gate_strength=1.0
+        )
+
+        maps = build_merge_diagnostic_maps(
+            0.8,
+            similarities,
+            action_scores,
+            effective,
+            torch.tensor([1, 3]),
+            (2, 2),
+            1.0,
+        )
+
+        self.assertEqual(int(maps["valid_mask"].sum()), 2)
+        self.assertAlmostEqual(float(maps["base_weights"][1, 1]), 0.8)
+        self.assertAlmostEqual(float(maps["effective_weights"][1, 1]), 0.4)
+        self.assertAlmostEqual(float(maps["suppressed_weights"][1, 1]), 0.4)
+
+    def test_diagnostic_maps_reject_weights_not_produced_by_formula(self):
+        with self.assertRaises(RuntimeError):
+            build_merge_diagnostic_maps(
+                0.8,
+                torch.tensor([1.0]),
+                torch.tensor([1.0]),
+                torch.tensor([0.8]),
+                torch.tensor([0]),
+                (1, 1),
+                1.0,
             )
 
 

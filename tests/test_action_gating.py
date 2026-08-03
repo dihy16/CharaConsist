@@ -14,7 +14,7 @@ from models.action_gating import (  # noqa: E402
     build_merge_diagnostic_maps,
     normalize_action_attention,
 )
-from prompt_utils import build_prompt_and_spans  # noqa: E402
+from characonsist.prompts import build_prompt_and_spans  # noqa: E402
 
 
 class FakeTokenizer:

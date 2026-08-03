@@ -6,7 +6,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from run_batch_inference import MARKER_NAME, main, marker_matches, merge_delivery_failures, success_record, write_summary
+from characonsist.runners.batch import (
+    MARKER_NAME,
+    main,
+    marker_matches,
+    merge_delivery_failures,
+    success_record,
+    write_summary,
+)
 
 
 class BatchInferenceTests(unittest.TestCase):
@@ -131,3 +138,51 @@ class BatchInferenceTests(unittest.TestCase):
             )
             self.assertTrue(results.joinpath("lambda_0p50", "seed_8", "bg_fg", "scene", MARKER_NAME).is_file())
             self.assertGreaterEqual(len(resets), len(calls))
+
+    def test_main_runs_component_modes_with_the_same_seed(self):
+        calls = []
+
+        def run_prompt_file(_pipe, args):
+            Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+            calls.append((args.consistency_mode, args.seed, args.use_interpolate, args.action_gate_strength))
+
+        fake_inference = types.SimpleNamespace(
+            initialize_pipeline=lambda _args: object(),
+            reset_runtime_state=lambda _pipe, _args: None,
+            run_prompt_file=run_prompt_file,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            prompts = root / "prompts"
+            prompts.mkdir()
+            (prompts / "scene.txt").write_text("background#subject#action\n", encoding="utf-8")
+            argv = [
+                "run_batch_inference.py",
+                "--root", str(root),
+                "--prompts-dir", str(prompts),
+                "--model-path", "model",
+                "--init-mode", "0",
+                "--results-dir", str(root / "results"),
+                "--summary", str(root / "summary.json"),
+                "--consistency-modes", "prompt_only,attention_only,full",
+                "--seeds", "2025",
+            ]
+            with patch.dict(sys.modules, {"inference": fake_inference}), patch.object(sys, "argv", argv):
+                self.assertEqual(main(), 0)
+
+            self.assertEqual(
+                calls,
+                [
+                    ("prompt_only", 2025, False, 0.0),
+                    ("attention_only", 2025, False, 0.0),
+                    ("full", 2025, True, 0.0),
+                ],
+            )
+            for mode in ("prompt_only", "attention_only", "full"):
+                self.assertTrue(
+                    root.joinpath(
+                        "results", "component_ablation", mode, "seed_2025",
+                        "bg_fg", "scene", MARKER_NAME,
+                    ).is_file()
+                )

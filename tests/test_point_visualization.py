@@ -7,7 +7,11 @@ import numpy as np
 import torch
 from PIL import Image
 
-from point_visualization import build_dense_correspondence, save_dense_correspondence, tensor_to_numpy
+from characonsist.diagnostics.points import (
+    build_dense_correspondence,
+    save_dense_correspondence,
+    tensor_to_numpy,
+)
 
 
 class PointVisualizationTests(unittest.TestCase):

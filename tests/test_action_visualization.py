@@ -5,7 +5,10 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from action_visualization import action_score_array, save_action_attention_artifacts
+from characonsist.diagnostics.action_attention import (
+    action_score_array,
+    save_action_attention_artifacts,
+)
 
 
 class ActionVisualizationTests(unittest.TestCase):

@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from visualize_lambda_results import (
+from characonsist.visualization.lambda_comparison import (
     create_diagnostic_comparisons,
     create_lambda_comparison,
     find_lambda_directories,

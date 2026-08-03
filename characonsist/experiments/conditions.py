@@ -7,6 +7,8 @@ from pathlib import Path
 
 DEFAULT_ACTION_GATE_STRENGTHS = "0,0.25,0.5,0.75,1"
 DEFAULT_SEEDS = "2025"
+DEFAULT_CONSISTENCY_MODES = "prompt_only,attention_only,full"
+CONSISTENCY_MODES = ("prompt_only", "attention_only", "full")
 
 
 def _csv_items(value, name):
@@ -47,6 +49,19 @@ def parse_seeds(value):
         if seed not in seeds:
             seeds.append(seed)
     return seeds
+
+
+def parse_consistency_modes(value):
+    """Parse unique component-ablation modes in stable order."""
+    modes = []
+    for item in _csv_items(value, "consistency modes"):
+        mode = str(item).strip().lower().replace("-", "_")
+        if mode not in CONSISTENCY_MODES:
+            allowed = ", ".join(CONSISTENCY_MODES)
+            raise ValueError(f"Unknown consistency mode {item!r}; choose from {allowed}.")
+        if mode not in modes:
+            modes.append(mode)
+    return modes
 
 
 def lambda_label(strength):
@@ -98,3 +113,37 @@ def find_condition(conditions, action_gate_strength, seed):
             return condition
     raise ValueError(f"Sweep condition lambda={strength}, seed={parsed_seed} was not configured.")
 
+
+@dataclass(frozen=True)
+class ComponentCondition:
+    consistency_mode: str
+    seed: int
+
+    @property
+    def key(self):
+        return f"component_ablation/{self.consistency_mode}/seed_{self.seed}"
+
+    @property
+    def output_prefix(self):
+        return Path("component_ablation") / self.consistency_mode / f"seed_{self.seed}" / "bg_fg"
+
+
+def build_component_conditions(consistency_modes, seeds):
+    """Build mode-major, seed-matched component-ablation conditions."""
+    modes = parse_consistency_modes(consistency_modes)
+    parsed_seeds = parse_seeds(seeds)
+    return [
+        ComponentCondition(consistency_mode=mode, seed=seed)
+        for mode in modes
+        for seed in parsed_seeds
+    ]
+
+
+def find_component_condition(conditions, consistency_mode, seed):
+    """Return an allowed component condition or reject an unexpected request."""
+    mode = parse_consistency_modes([consistency_mode])[0]
+    parsed_seed = parse_seeds([seed])[0]
+    for condition in conditions:
+        if condition.consistency_mode == mode and condition.seed == parsed_seed:
+            return condition
+    raise ValueError(f"Component condition mode={mode}, seed={parsed_seed} was not configured.")

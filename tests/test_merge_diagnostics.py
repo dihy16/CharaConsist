@@ -5,7 +5,10 @@ from pathlib import Path
 
 import numpy as np
 
-from merge_diagnostics import save_frame_merge_diagnostics, save_prompt_gate_audit
+from characonsist.diagnostics.merge import (
+    save_frame_merge_diagnostics,
+    save_prompt_gate_audit,
+)
 
 
 def diagnostic_state(gate_strength):

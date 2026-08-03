@@ -418,6 +418,15 @@ class CharaConsistAttnProcessor2_0:
                 timestep_ind,
                 query.device,
                 **spatial_kwargs)
+            component_state = spatial_kwargs.get("component_audit_state")
+            if component_state is not None and fg_share_flag:
+                component_state["identity_attention_invocations"] = (
+                    component_state.get("identity_attention_invocations", 0) + 1
+                )
+                component_state["identity_token_applications"] = (
+                    component_state.get("identity_token_applications", 0)
+                    + int(saved_key.shape[2])
+                )
             key = torch.cat([key, saved_key], dim=2)
             value = torch.cat([value, saved_value], dim=2)
 
@@ -439,6 +448,11 @@ class CharaConsistAttnProcessor2_0:
 
         if attn_out_interpolate:
             if fg_share_flag:
+                component_state = spatial_kwargs.get("component_audit_state")
+                if component_state is not None:
+                    component_state["adaptive_merge_invocations"] = (
+                        component_state.get("adaptive_merge_invocations", 0) + 1
+                    )
                 hidden_states = self.ada_tome(
                     hidden_states,
                     timestep_ind,

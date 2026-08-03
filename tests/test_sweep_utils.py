@@ -1,10 +1,12 @@
 import unittest
 from pathlib import Path
 
-from sweep_utils import (
+from characonsist.experiments.conditions import (
+    build_component_conditions,
     build_sweep_conditions,
     lambda_label,
     parse_action_gate_strengths,
+    parse_consistency_modes,
     parse_seeds,
 )
 
@@ -35,7 +37,30 @@ class SweepUtilsTests(unittest.TestCase):
             Path("lambda_0p25") / "seed_2026" / "bg_fg",
         )
 
+    def test_builds_seed_matched_component_paths(self):
+        conditions = build_component_conditions(
+            "prompt-only,attention_only,full", "2025,2026"
+        )
+
+        self.assertEqual(
+            [(item.consistency_mode, item.seed) for item in conditions],
+            [
+                ("prompt_only", 2025),
+                ("prompt_only", 2026),
+                ("attention_only", 2025),
+                ("attention_only", 2026),
+                ("full", 2025),
+                ("full", 2026),
+            ],
+        )
+        self.assertEqual(
+            conditions[-1].output_prefix,
+            Path("component_ablation") / "full" / "seed_2026" / "bg_fg",
+        )
+        self.assertEqual(parse_consistency_modes("full,full"), ["full"])
+        with self.assertRaises(ValueError):
+            parse_consistency_modes("unknown")
+
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -27,6 +27,8 @@ Options:
   --output-dir <path>    Local directory for downloaded results (default: results_colab)
   --action-gate-strengths <csv>
                          Lambda sweep values (default: 0,0.25,0.5,0.75,1)
+  --consistency-modes <csv>
+                         Component ablation modes; disables the lambda sweep
   --seeds <csv>          Generation seeds (default: 2025)
   --keep                 Leave the Colab session running after completion or failure
   -h, --help             Show this help
@@ -42,6 +44,7 @@ EXEC_TIMEOUT=7200
 LOCAL_OUTPUT_DIR="results_colab"
 KEEP_SESSION=false
 ACTION_GATE_STRENGTHS="0,0.5,1"
+CONSISTENCY_MODES=""
 SEEDS="2025"
 
 while [[ $# -gt 0 ]]; do
@@ -79,6 +82,11 @@ while [[ $# -gt 0 ]]; do
     --action-gate-strengths)
       [[ $# -ge 2 ]] || { echo "Error: --action-gate-strengths needs a value" >&2; exit 2; }
       ACTION_GATE_STRENGTHS="$2"
+      shift 2
+      ;;
+    --consistency-modes)
+      [[ $# -ge 2 ]] || { echo "Error: --consistency-modes needs a value" >&2; exit 2; }
+      CONSISTENCY_MODES="$2"
       shift 2
       ;;
     --seeds)
@@ -122,15 +130,19 @@ done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if ! PYTHONPATH="$SCRIPT_DIR" python3 - "$ACTION_GATE_STRENGTHS" "$SEEDS" <<'PY'
+if ! PYTHONPATH="$SCRIPT_DIR" python3 - "$ACTION_GATE_STRENGTHS" "$SEEDS" "$CONSISTENCY_MODES" <<'PY'
 import sys
-from sweep_utils import build_sweep_conditions
+from characonsist.experiments.conditions import build_component_conditions, build_sweep_conditions
 
-conditions = build_sweep_conditions(sys.argv[1], sys.argv[2])
-print(f"Validated {len(conditions)} lambda/seed condition(s).")
+conditions = (
+    build_component_conditions(sys.argv[3], sys.argv[2])
+    if sys.argv[3]
+    else build_sweep_conditions(sys.argv[1], sys.argv[2])
+)
+print(f"Validated {len(conditions)} condition(s).")
 PY
 then
-  echo "Error: invalid lambda sweep configuration" >&2
+  echo "Error: invalid experiment configuration" >&2
   exit 2
 fi
 
@@ -203,12 +215,16 @@ echo "  Model download fallback: $MODEL_REPO"
 echo "  Initialization mode: 0 (single GPU)"
 echo "  Attention masks: enabled"
 echo "  Action and exact merge maps: enabled"
-echo "  Lambda values: $ACTION_GATE_STRENGTHS"
+if [[ -n "$CONSISTENCY_MODES" ]]; then
+  echo "  Consistency modes: $CONSISTENCY_MODES (lambda fixed at 0)"
+else
+  echo "  Lambda values: $ACTION_GATE_STRENGTHS"
+fi
 echo "  Seeds: $SEEDS"
 echo "  Colab command timeout: ${EXEC_TIMEOUT}s"
 
 # Upload only project source. Model weights stay at the supplied remote path.
-tar -C "$SCRIPT_DIR" -czf "$SOURCE_ARCHIVE" inference.py prompt_utils.py point_visualization.py action_visualization.py merge_diagnostics.py sweep_utils.py make_story_image.py run_colab_remote.py run_batch_inference.py run_colab_worker.py requirements-colab.txt models
+tar --exclude='__pycache__' --exclude='*.pyc' -C "$SCRIPT_DIR" -czf "$SOURCE_ARCHIVE" inference.py make_story_image.py run_colab_remote.py run_batch_inference.py run_colab_worker.py compare_component_results.py visualize_lambda_results.py requirements-colab.txt characonsist models
 tar -C "$PROMPTS_FOLDER" -czf "$PROMPTS_ARCHIVE" .
 
 NEW_COMMAND=(colab new -s "$SESSION_NAME")
@@ -354,7 +370,7 @@ import json
 import sys
 from pathlib import Path
 
-from run_batch_inference import merge_delivery_failures
+from characonsist.runners.batch import merge_delivery_failures
 
 remote_path, failures_path, destination = map(Path, sys.argv[1:])
 delivery_failures = []
@@ -364,7 +380,10 @@ if failures_path.is_file():
         path_parts = Path(task_path).parts
         delivery_failures.append({
             "prompt_file": task_path,
-            "condition": "/".join(path_parts[:2]),
+            "condition": "/".join(
+                path_parts[:3] if path_parts and path_parts[0] == "component_ablation"
+                else path_parts[:2]
+            ),
             "exit_code": 1,
             "source": "local_result_delivery",
             "error": reason,
@@ -379,10 +398,10 @@ PY
 }
 
 local_result_is_current() {
-  PYTHONPATH="$SCRIPT_DIR" python3 - "$1" "$2" "$MODEL_PATH" "$3" "$4" <<'PY'
+  PYTHONPATH="$SCRIPT_DIR" python3 - "$1" "$2" "$MODEL_PATH" "$3" "$4" "$5" <<'PY'
 import sys
 from pathlib import Path
-from run_batch_inference import inference_settings, marker_matches, success_record
+from characonsist.runners.batch import inference_settings, marker_matches, success_record
 import argparse
 
 prompt, output, model_path = map(Path, sys.argv[1:4])
@@ -397,7 +416,8 @@ config = argparse.Namespace(
     height=768,
     width=768,
     seed=int(sys.argv[5]),
-    use_interpolate=True,
+    consistency_mode=sys.argv[6],
+    use_interpolate=(sys.argv[6] == "full"),
     action_gate_strength=float(sys.argv[4]),
 )
 raise SystemExit(0 if marker_matches(output, success_record(prompt, inference_settings(config))) else 1)
@@ -409,21 +429,26 @@ MODEL_B64="$(encode_for_python "$MODEL_PATH")"
 REPO_B64="$(encode_for_python "$MODEL_REPO")"
 STRENGTHS_B64="$(encode_for_python "$ACTION_GATE_STRENGTHS")"
 SEEDS_B64="$(encode_for_python "$SEEDS")"
+MODES_B64="$(encode_for_python "$CONSISTENCY_MODES")"
 echo "Initializing one persistent Colab inference worker..."
-colab_exec "import base64, sys; root=base64.b64decode('$ROOT_B64').decode(); sys.path.insert(0, root); import run_colab_worker as worker; print('CHARACONSIST_WORKER_RESULT='+__import__('json').dumps(worker.start(root, base64.b64decode('$MODEL_B64').decode(), base64.b64decode('$REPO_B64').decode(), 0, base64.b64decode('$STRENGTHS_B64').decode(), base64.b64decode('$SEEDS_B64').decode())))"
+colab_exec "import base64, sys; root=base64.b64decode('$ROOT_B64').decode(); sys.path.insert(0, root); import run_colab_worker as worker; print('CHARACONSIST_WORKER_RESULT='+__import__('json').dumps(worker.start(root, base64.b64decode('$MODEL_B64').decode(), base64.b64decode('$REPO_B64').decode(), 0, base64.b64decode('$STRENGTHS_B64').decode(), base64.b64decode('$SEEDS_B64').decode(), base64.b64decode('$MODES_B64').decode())))"
 
 BATCH_FAILURES=0
-while IFS=$'\t' read -r action_gate_strength lambda_name seed; do
+while IFS=$'\t' read -r experiment_kind consistency_mode action_gate_strength condition_prefix seed; do
   while IFS= read -r -d '' prompt_file; do
     relative_prompt="${prompt_file#"$PROMPTS_FOLDER"/}"
     prompt_output="${relative_prompt%.txt}"
-    relative_output="$lambda_name/seed_$seed/bg_fg/$prompt_output"
+    relative_output="$condition_prefix/seed_$seed/bg_fg/$prompt_output"
     local_output="$LOCAL_OUTPUT_DIR/$relative_output"
     relative_b64="$(encode_for_python "$relative_prompt")"
 
-    if local_result_is_current "$prompt_file" "$local_output" "$action_gate_strength" "$seed"; then
+    if local_result_is_current "$prompt_file" "$local_output" "$action_gate_strength" "$seed" "$consistency_mode"; then
       echo "Skipping locally verified result: $relative_output"
-      colab_exec "import base64, json, run_colab_worker as worker; print('CHARACONSIST_PROMPT_RESULT='+json.dumps(worker.record_local_skip(base64.b64decode('$relative_b64').decode(), $action_gate_strength, $seed)))"
+      if [[ "$experiment_kind" == "component" ]]; then
+        colab_exec "import base64, json, run_colab_worker as worker; print('CHARACONSIST_PROMPT_RESULT='+json.dumps(worker.record_component_local_skip(base64.b64decode('$relative_b64').decode(), '$consistency_mode', $seed)))"
+      else
+        colab_exec "import base64, json, run_colab_worker as worker; print('CHARACONSIST_PROMPT_RESULT='+json.dumps(worker.record_local_skip(base64.b64decode('$relative_b64').decode(), $action_gate_strength, $seed)))"
+      fi
       continue
     fi
 
@@ -433,7 +458,12 @@ while IFS=$'\t' read -r action_gate_strength lambda_name seed; do
     PENDING_LOCAL_ARCHIVE="$WORK_DIR/result_archives/$relative_output.tar.gz"
     worker_output_file="$WORK_DIR/worker-output.txt"
     : > "$worker_output_file"
-    if ! colab_exec "import base64, json, run_colab_worker as worker; print('CHARACONSIST_PROMPT_RESULT='+json.dumps(worker.run_one(base64.b64decode('$relative_b64').decode(), $action_gate_strength, $seed)))" 2>&1 | tee "$worker_output_file"; then
+    if [[ "$experiment_kind" == "component" ]]; then
+      worker_command="worker.run_component(base64.b64decode('$relative_b64').decode(), '$consistency_mode', $seed)"
+    else
+      worker_command="worker.run_one(base64.b64decode('$relative_b64').decode(), $action_gate_strength, $seed)"
+    fi
+    if ! colab_exec "import base64, json, run_colab_worker as worker; print('CHARACONSIST_PROMPT_RESULT='+json.dumps($worker_command))" 2>&1 | tee "$worker_output_file"; then
       echo "Error: Colab worker became unavailable; finalized earlier results will be recovered during cleanup." >&2
       exit 1
     fi
@@ -447,7 +477,7 @@ while IFS=$'\t' read -r action_gate_strength lambda_name seed; do
         PENDING_LOCAL_ARCHIVE=""
         merge_remote_summary || true
         echo "Result delivery failed for '$relative_output'; continuing so it can be retried next run." >&2
-      elif ! local_result_is_current "$prompt_file" "$local_output" "$action_gate_strength" "$seed"; then
+      elif ! local_result_is_current "$prompt_file" "$local_output" "$action_gate_strength" "$seed" "$consistency_mode"; then
         record_local_failure "$relative_output" "downloaded result did not pass marker verification for the current settings"
         BATCH_FAILURES=1
         PENDING_REMOTE_ARCHIVE=""
@@ -465,12 +495,16 @@ while IFS=$'\t' read -r action_gate_strength lambda_name seed; do
       echo "Sweep task failed; continuing with the next task." >&2
     fi
   done < <(find "$PROMPTS_FOLDER" -type f -name '*.txt' -print0 | sort -z)
-done < <(PYTHONPATH="$SCRIPT_DIR" python3 - "$ACTION_GATE_STRENGTHS" "$SEEDS" <<'PY'
+done < <(PYTHONPATH="$SCRIPT_DIR" python3 - "$ACTION_GATE_STRENGTHS" "$SEEDS" "$CONSISTENCY_MODES" <<'PY'
 import sys
-from sweep_utils import build_sweep_conditions
+from characonsist.experiments.conditions import build_component_conditions, build_sweep_conditions
 
-for condition in build_sweep_conditions(sys.argv[1], sys.argv[2]):
-    print(f"{condition.action_gate_strength}\t{condition.lambda_label}\t{condition.seed}")
+if sys.argv[3]:
+    for condition in build_component_conditions(sys.argv[3], sys.argv[2]):
+        print(f"component\t{condition.consistency_mode}\t0\tcomponent_ablation/{condition.consistency_mode}\t{condition.seed}")
+else:
+    for condition in build_sweep_conditions(sys.argv[1], sys.argv[2]):
+        print(f"lambda\tfull\t{condition.action_gate_strength}\t{condition.lambda_label}\t{condition.seed}")
 PY
 )
 

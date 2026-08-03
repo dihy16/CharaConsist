@@ -11,6 +11,8 @@ from diffusers.pipelines.flux.pipeline_flux import retrieve_timesteps, calculate
 from diffusers.pipelines.flux.pipeline_output import FluxPipelineOutput
 from diffusers.utils.torch_utils import randn_tensor
 
+from characonsist.diagnostics.components import normalize_consistency_mode
+
 from .attention_processor_characonsist import (
     get_curr_fg_mask_and_action_scores,
     get_cross_sim,
@@ -66,6 +68,7 @@ class CharaConsistPipeline(FluxPipeline):
         is_id: bool = False,
         is_pre_run: bool = False,
         use_interpolate: bool = True,
+        consistency_mode: Optional[str] = None,
         share_bg: bool = True,
         update_bg: bool = False,
         attn_start_step: int = 1,
@@ -87,6 +90,9 @@ class CharaConsistPipeline(FluxPipeline):
                 "action_gate_strength must be between 0 and 1, "
                 f"got {action_gate_strength}."
             )
+        consistency_mode = normalize_consistency_mode(consistency_mode, use_interpolate)
+        enable_identity_attention = consistency_mode != "prompt_only"
+        enable_adaptive_merge = consistency_mode == "full"
 
         # 1. Check inputs. Raise error if not correct
         self.check_inputs(
@@ -179,10 +185,10 @@ class CharaConsistPipeline(FluxPipeline):
         def get_consist_kwargs(i):
             if is_id:
                 save_attn_weight = save_all_steps or (i == save_mask_point_step)
-                save_attn_kv = (i < attn_end_step) and (i >= attn_start_step)
-                update_attn_kv = update_bg & (i < attn_end_step) and (i >= attn_start_step)
-                save_attn_out_for_sim = save_all_steps or (i == save_mask_point_step)
-                save_attn_out_for_interpolate = use_interpolate and (i < interpolate_end_step) and (i >= interpolate_start_step)
+                save_attn_kv = enable_identity_attention and (i < attn_end_step) and (i >= attn_start_step)
+                update_attn_kv = enable_identity_attention and update_bg and (i < attn_end_step) and (i >= attn_start_step)
+                save_attn_out_for_sim = enable_identity_attention and (save_all_steps or (i == save_mask_point_step))
+                save_attn_out_for_interpolate = enable_adaptive_merge and (i < interpolate_end_step) and (i >= interpolate_start_step)
                 save_cross_sim = False
                 fg_inter_img_attn = False
                 bg_inter_img_attn = False
@@ -193,20 +199,20 @@ class CharaConsistPipeline(FluxPipeline):
                 update_attn_kv = False
                 save_attn_out_for_sim = False
                 save_attn_out_for_interpolate = False
-                save_cross_sim = save_all_steps or (i == save_mask_point_step)
+                save_cross_sim = enable_identity_attention and (save_all_steps or (i == save_mask_point_step))
                 fg_inter_img_attn = False
-                bg_inter_img_attn = (i < attn_end_step) and (i >= attn_start_step) and share_bg and (not update_bg)
+                bg_inter_img_attn = enable_identity_attention and (i < attn_end_step) and (i >= attn_start_step) and share_bg and (not update_bg)
                 attn_out_interpolate = False
             else:
                 save_attn_weight = save_all_steps or (i <= save_mask_point_step)
                 save_attn_kv = False
-                update_attn_kv = update_bg & (i < attn_end_step) and (i >= attn_start_step)
+                update_attn_kv = enable_identity_attention and update_bg and (i < attn_end_step) and (i >= attn_start_step)
                 save_attn_out_for_sim = False
                 save_attn_out_for_interpolate = False
-                save_cross_sim = save_all_steps or (i == save_mask_point_step)
-                fg_inter_img_attn = (i < attn_end_step) and (i >= attn_start_step)
-                bg_inter_img_attn = (i < attn_end_step) and (i >= attn_start_step) and share_bg and (not update_bg)
-                attn_out_interpolate = use_interpolate & (i < interpolate_end_step) and (i >= interpolate_start_step)
+                save_cross_sim = enable_identity_attention and (save_all_steps or (i == save_mask_point_step))
+                fg_inter_img_attn = enable_identity_attention and (i < attn_end_step) and (i >= attn_start_step)
+                bg_inter_img_attn = enable_identity_attention and (i < attn_end_step) and (i >= attn_start_step) and share_bg and (not update_bg)
+                attn_out_interpolate = enable_adaptive_merge and (i < interpolate_end_step) and (i >= interpolate_start_step)
             return dict(
                 timestep_ind=i,
                 save_attn_weight = save_attn_weight,

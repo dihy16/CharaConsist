@@ -121,6 +121,33 @@ of a later scene is marked `update_bg=True`.
 7. **Reset** — `reset_id_bank` clears retained attention tensors before the
    next independent scene.
 
+### Point matching, point tracking, and adaptive token merge
+
+These are sequential but distinct parts of cross-frame consistency:
+
+1. **Point matching** asks which identity-frame spatial token corresponds to
+   each current-frame token. The pre-run compares normalized current and
+   identity attention outputs, producing cross-image similarities, argmax
+   correspondence indices, and confidence values. Matching locates a likely
+   identity point; it does not modify the current hidden states.
+2. **Point tracking** combines those correspondences with foreground masks and
+   validity checks. It creates the allowed foreground/background regions and
+   attention masks, preventing invalid identity sharing across regions. The
+   tracked masks and indices are also what the point diagnostics visualize.
+3. **Adaptive token merge** uses the valid matches to update current-frame
+   hidden states. For a matched token, the update is conceptually
+   `(1 - alpha) * current + alpha * identity`, where `alpha` is determined by
+   the interpolation schedule, match confidence, and optional action gate.
+
+`attention_only` retains identity attention and performs matching/tracking but
+does not perform adaptive token merge. `full` enables all three operations.
+With `use_interpolate=True`, identity attention outputs are retained for many
+denoising timesteps in the per-processor `id_attn_bank`; those tensors support
+the later merge and account for the additional CPU-memory usage. Matching can
+still retain the selected attention output it needs when interpolation is
+disabled. `reset_id_bank` must run between independent scenes so these
+per-timestep tensors are not carried into the next generation.
+
 ## Core Modules
 
 ### `models/pipeline_characonsist.py`
@@ -156,11 +183,38 @@ blocks. The custom processor owns the state that connects frames:
 | `cross_sims` | Current-to-identity visual-token similarity used to find point matches. |
 | `bg_len`, `action_start`, `real_len` | Cumulative prompt token boundaries supplied by the runner. |
 | `action_scores` | Normalized continuous action-attention map used to gate adaptive token merge. |
+| `role_spans` | Optional cumulative subject, predicate, object, and recipient token ranges parsed from action tags. |
+| `role_maps` | Pre-run attention-derived soft actor/object/recipient maps and actor-object interaction union. |
 
 It builds a boolean expanded-attention mask, converts blocked connections to
 `-inf`, and supplies it to PyTorch scaled-dot-product attention. The helper
 functions at the end of the module install processors, set token lengths,
 aggregate masks/similarities, reset identity state, and update spatial size.
+
+### Minimal role-action routing ablation
+
+`characonsist/prompts.py` accepts optional `[S]`, `[A]`, `[O]`, and `[R]`
+annotations inside the action field. It strips the markup before model prompt
+encoding and derives role token boundaries from cumulative clean prefixes, so
+the strength-zero control sees the same prompt text as the baseline.
+
+At the mask step, `models/role_action_routing.py` converts the separate role
+attention maps into foreground-localized soft subject, object, recipient, and
+subject-object interaction maps. During full generation only, the custom
+attention processor adds a finite bias from current-image queries to:
+
+- subject tokens in the subject map;
+- predicate tokens in the subject-object interaction map;
+- object tokens in the object map;
+- recipient tokens in the recipient map.
+
+The bias is added to the existing `0/-inf` attention mask; blocked connections
+remain `-inf`. Strength zero returns the original mask without cloning it.
+This intervention does not change point matching, point tracking, adaptive
+merge weights, weights/checkpoints, or prompt text. The controlled runner also
+forces the separate action-merge gate to zero. `role_action_trace.json` and
+the maps under `role_action/` distinguish mechanism execution from semantic
+quality improvement.
 
 ### `characonsist/inference.py`
 
@@ -195,6 +249,11 @@ For a run rooted at `--out_dir`, normal mode writes:
     id.jpg
     0_pre.jpg
     0.jpg
+    role_action_trace.json
+    role_action/                 # role-bias ablation diagnostics
+      frame_0/
+        subject.npy
+        subject_overlay.jpg
     mask/                       # only with --save_mask
       id_mask.jpg
       0_mask.jpg
@@ -218,3 +277,25 @@ Mix mode writes `id.jpg`, numbered pre/final frames, optional masks, and
   they do not alter inference semantics. A fresh remote environment must have
   the source tree, dependencies, and model weights available before
   `inference.py` can run.
+### Character-conditioned action binding
+
+The minimal binding ablation uses indexed prompt spans without learned tokens.
+Full identity descriptions are tagged `C1`/`C2`; their unbiased pre-run
+image-to-text attention is independently foreground-normalized and frozen.
+During final denoising steps 1--40, every custom single-stream block adds a
+finite bias only to visual-query -> action-text keys: `A1` receives
+`beta*C1 - gamma*C2`, and `A2` receives the converse. Double-stream blocks,
+point correspondence, identity K/V, masks, and adaptive merge are unchanged.
+At beta=gamma=0 the helper returns the original attention mask object and makes
+no allocation, providing an exact no-op control.
+
+### K=2 entity identity routing
+
+`entity_routing_mode=hard` converts the unbiased C1/C2 attention maps into a
+categorical foreground ownership map. Current C1 tokens match only identity C1
+tokens, and C2 matches only C2. The gathered identity K/V tensor remains a
+single allocation, but its indices form logical per-entity banks. The expanded
+attention mask blocks every wrong-owner query-to-bank pair, and adaptive merge
+reuses the restricted correspondence. Routing does not alter current-frame
+self-attention or explicitly assign manipulated objects. The default `off`
+path retains the original foreground-wide behavior.

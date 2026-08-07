@@ -3,10 +3,12 @@ from pathlib import Path
 
 from characonsist.experiments.conditions import (
     build_component_conditions,
+    build_entity_routing_conditions,
     build_sweep_conditions,
     lambda_label,
     parse_action_gate_strengths,
     parse_consistency_modes,
+    parse_entity_routing_modes,
     parse_seeds,
 )
 
@@ -60,6 +62,20 @@ class SweepUtilsTests(unittest.TestCase):
         self.assertEqual(parse_consistency_modes("full,full"), ["full"])
         with self.assertRaises(ValueError):
             parse_consistency_modes("unknown")
+
+    def test_builds_routing_by_binding_by_seed_conditions(self):
+        conditions = build_entity_routing_conditions(
+            "off,hard", "0:0,1:0.5", "2025"
+        )
+        self.assertEqual(len(conditions), 4)
+        self.assertEqual(
+            conditions[-1].output_prefix,
+            Path("entity_routing_ablation") / "routing_hard"
+            / "beta_1p00_gamma_0p50" / "seed_2025" / "bg_fg",
+        )
+        self.assertEqual(parse_entity_routing_modes("hard,off,hard"), ["hard", "off"])
+        with self.assertRaises(ValueError):
+            parse_entity_routing_modes("soft")
 
 
 if __name__ == "__main__":

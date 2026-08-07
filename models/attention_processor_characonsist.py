@@ -18,6 +18,13 @@ from .action_gating import (
     build_merge_diagnostic_maps,
     normalize_action_attention,
 )
+from .role_action_routing import apply_role_attention_bias, build_soft_role_maps
+from .action_binding import apply_character_action_bias, build_character_maps
+from .entity_routing import (
+    apply_entity_identity_mask,
+    build_entity_identity_masks,
+    measure_entity_attention_mass,
+)
 
 
 class FluxAttnProcessor2_0:
@@ -47,6 +54,11 @@ class FluxAttnProcessor2_0:
         attn_out_interpolate: bool = False,
         interpolate_weight_dict: dict = dict(),
         action_gate_strength: float = 1.0,
+        role_action_bias_strength: float = 0.0,
+        action_binding_beta: float = 0.0,
+        action_binding_gamma: float = 0.0,
+        action_binding_active: bool = False,
+        entity_routing_mode: str = "off",
         spatial_kwargs: Optional[dict] = None,
         **kwargs,
     ) -> torch.FloatTensor:
@@ -55,6 +67,9 @@ class FluxAttnProcessor2_0:
         # prevents Diffusers from warning when it routes the same attention
         # kwargs to every processor.
         _ = action_gate_strength
+        _ = role_action_bias_strength
+        _ = action_binding_beta, action_binding_gamma, action_binding_active
+        _ = entity_routing_mode
         batch_size, _, _ = hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
 
         # `sample` projections.
@@ -149,6 +164,9 @@ class CharaConsistAttnProcessor2_0:
         self.bg_len = 0
         self.action_start = 0
         self.real_len = 0
+        self.role_spans = {}
+        self.binding_spans = {"characters": {}, "actions": {}}
+        self.block_index = None
         self.size = size
         # Save id info
         self.id_attn_bank = dict()
@@ -165,7 +183,26 @@ class CharaConsistAttnProcessor2_0:
             action_attn_weights = attn_weights[:, self.action_start:].mean(1)
         else:
             action_attn_weights = torch.zeros_like(fg_attn_weights)
-        return bg_attn_weights, fg_attn_weights, action_attn_weights
+        role_attn_weights = {}
+        for role, (start, end) in self.role_spans.items():
+            start = max(0, min(start, self.real_len))
+            end = max(start, min(end, self.real_len))
+            if start < end:
+                role_attn_weights[role] = attn_weights[:, start:end].mean(1)
+        binding_attn_weights = {"characters": {}, "actions": {}}
+        for kind in ("characters", "actions"):
+            for entity_id, (start, end) in self.binding_spans.get(kind, {}).items():
+                start = max(0, min(start, self.real_len))
+                end = max(start, min(end, self.real_len))
+                if start < end:
+                    binding_attn_weights[kind][entity_id] = attn_weights[:, start:end].mean(1)
+        return (
+            bg_attn_weights,
+            fg_attn_weights,
+            action_attn_weights,
+            role_attn_weights,
+            binding_attn_weights,
+        )
     
     def get_curr_cross_sim(self, curr_hidden_states, timestep_ind):
         id_hidden_states = self.id_attn_bank[timestep_ind]["attn_out"].to(curr_hidden_states.device, non_blocking=True)
@@ -174,7 +211,18 @@ class CharaConsistAttnProcessor2_0:
             F.normalize(id_hidden_states, dim=-1).transpose(-2, -1))
         return sim
     
-    def get_expand_attn_mask(self, id_fg_mask, curr_fg_mask, bg_share_flag, fg_share_flag, device):
+    def get_expand_attn_mask(
+        self,
+        id_fg_mask,
+        curr_fg_mask,
+        bg_share_flag,
+        fg_share_flag,
+        device,
+        appended_entity_labels=None,
+        curr_entity_labels=None,
+        entity_routing_mode="off",
+        routing_trace_state=None,
+    ):
         id_len = len(id_fg_mask)
         _id_fg_mask = id_fg_mask.view(1, 1, 1, -1)
         _curr_fg_mask = curr_fg_mask.view(1, 1, -1, 1)
@@ -183,8 +231,22 @@ class CharaConsistAttnProcessor2_0:
             expand_mask[:, :, :, ~id_fg_mask] = True
         elif not fg_share_flag:
             expand_mask[:, :, :, id_fg_mask] = True
+        entity_masks = None
+        if entity_routing_mode == "hard":
+            if appended_entity_labels is None or curr_entity_labels is None:
+                raise RuntimeError("Hard entity routing requires identity and current entity labels.")
+            entity_masks = build_entity_identity_masks(
+                expand_mask, appended_entity_labels, curr_entity_labels
+            )
+            expand_mask = apply_entity_identity_mask(
+                expand_mask,
+                appended_entity_labels,
+                curr_entity_labels,
+                routing_trace_state,
+                entity_masks,
+            )
         t2i_expand_mask = torch.ones((1, 1, self.text_seq_len, id_len), device=device, dtype=bool)
-        return torch.cat((t2i_expand_mask, expand_mask), dim=-2)
+        return torch.cat((t2i_expand_mask, expand_mask), dim=-2), entity_masks
     
     def get_expanded_key_value(
             self,
@@ -199,6 +261,10 @@ class CharaConsistAttnProcessor2_0:
             id_fg_inds=None,
             id_bg_inds=None,
             curr_fg_inds=None,
+            id_entity_labels=None,
+            curr_entity_labels=None,
+            entity_routing_mode="off",
+            entity_routing_trace_state=None,
             **kwargs):
         
         saved_key, saved_value = None, None
@@ -208,6 +274,7 @@ class CharaConsistAttnProcessor2_0:
         ori_saved_key = self.id_attn_bank[timestep_ind]["key"].to(device, non_blocking=True)
         ori_saved_value = self.id_attn_bank[timestep_ind]["value"].to(device, non_blocking=True)
 
+        appended_entity_labels = None
         if bg_share_flag:
             assert id_bg_mask is not None
             id_bg_mask = id_bg_mask.flatten().to(device, non_blocking=True)
@@ -224,10 +291,21 @@ class CharaConsistAttnProcessor2_0:
             )
             saved_key = apply_rotary_emb(saved_key, image_rotary_emb_bg)
             id_fg_mask = torch.zeros([saved_key.shape[2]], device=device, dtype=torch.bool)
+            if entity_routing_mode == "hard":
+                appended_entity_labels = torch.zeros(
+                    saved_key.shape[2], device=device, dtype=torch.long
+                )
         
         if fg_share_flag:
             saved_key_fg = ori_saved_key[:, :, id_fg_inds]
             saved_value_fg = ori_saved_value[:, :, id_fg_inds]
+            saved_entity_labels_fg = None
+            if entity_routing_mode == "hard":
+                if id_entity_labels is None:
+                    raise RuntimeError("Hard entity routing requires identity entity labels.")
+                saved_entity_labels_fg = id_entity_labels.flatten().to(
+                    device=device, dtype=torch.long
+                )[id_fg_inds]
             image_rotary_emb_fg = (
                 image_rotary_emb[0][curr_fg_inds],
                 image_rotary_emb[1][curr_fg_inds],
@@ -238,18 +316,43 @@ class CharaConsistAttnProcessor2_0:
                 saved_value = torch.cat([saved_value, saved_value_fg], dim=2)
                 id_fg_mask = torch.zeros([saved_key.shape[2]], device=device, dtype=torch.bool)
                 id_fg_mask[-saved_key_fg.shape[2]:] = True
+                if entity_routing_mode == "hard":
+                    appended_entity_labels = torch.cat(
+                        [appended_entity_labels, saved_entity_labels_fg]
+                    )
             else:
                 saved_key = saved_key_fg
                 saved_value = saved_value_fg
                 id_fg_mask = torch.ones([saved_key.shape[2]], device=device, dtype=torch.bool)
+                if entity_routing_mode == "hard":
+                    appended_entity_labels = saved_entity_labels_fg
         
-        expand_mask= self.get_expand_attn_mask(
-            id_fg_mask, curr_fg_mask, bg_share_flag, fg_share_flag, device=device)
+        expand_mask, entity_masks = self.get_expand_attn_mask(
+            id_fg_mask,
+            curr_fg_mask,
+            bg_share_flag,
+            fg_share_flag,
+            device=device,
+            appended_entity_labels=appended_entity_labels,
+            curr_entity_labels=curr_entity_labels,
+            entity_routing_mode=entity_routing_mode,
+            routing_trace_state=entity_routing_trace_state,
+        )
         attention_mask = torch.zeros(
             (1, 1, self.text_seq_len + self.visual_seq_len, self.text_seq_len + self.visual_seq_len + len(id_fg_mask)), 
             device=device, dtype=torch.bfloat16)
         attention_mask[:, :, :, self.text_seq_len + self.visual_seq_len:].masked_fill_(expand_mask, float('-inf'))
-        return saved_key, saved_value, attention_mask
+        full_entity_masks = None
+        if entity_masks is not None:
+            full_entity_masks = []
+            for entity_mask in entity_masks:
+                full_mask = torch.zeros_like(attention_mask, dtype=torch.bool)
+                full_mask[
+                    :, :, self.text_seq_len:, self.text_seq_len + self.visual_seq_len:
+                ] = entity_mask
+                full_entity_masks.append(full_mask)
+            full_entity_masks = tuple(full_entity_masks)
+        return saved_key, saved_value, attention_mask, full_entity_masks
     
     
     def ada_tome(
@@ -335,6 +438,11 @@ class CharaConsistAttnProcessor2_0:
         attn_out_interpolate: bool = False,
         interpolate_weight_dict: dict = dict(),
         action_gate_strength: float = 1.0,
+        role_action_bias_strength: float = 0.0,
+        action_binding_beta: float = 0.0,
+        action_binding_gamma: float = 0.0,
+        action_binding_active: bool = False,
+        entity_routing_mode: str = "off",
         spatial_kwargs: Optional[dict] = None,
         **kwargs,
     ) -> torch.FloatTensor:
@@ -401,22 +509,34 @@ class CharaConsistAttnProcessor2_0:
             key = apply_rotary_emb(key, image_rotary_emb)
 
         if save_attn_weight:
-            bg_attn, fg_attn, action_attn = self.get_curr_attn_weights(query, key)
+            bg_attn, fg_attn, action_attn, role_attns, binding_attns = self.get_curr_attn_weights(query, key)
             self.attn_weights = dict(
                 bg=bg_attn.to("cuda:0", non_blocking=True),
                 fg=fg_attn.to("cuda:0", non_blocking=True),
                 action=action_attn.to("cuda:0", non_blocking=True),
             )
+            for role, role_attn in role_attns.items():
+                self.attn_weights[f"role_{role}"] = role_attn.to(
+                    "cuda:0", non_blocking=True
+                )
+            for kind, entity_maps in binding_attns.items():
+                prefix = "binding_character" if kind == "characters" else "binding_action"
+                for entity_id, binding_attn in entity_maps.items():
+                    self.attn_weights[f"{prefix}_{entity_id}"] = binding_attn.to(
+                        "cuda:0", non_blocking=True
+                    )
         
         fg_share_flag = self.fg_share_flag and fg_inter_img_attn
         bg_share_flag = self.bg_share_flag and bg_inter_img_attn and (not update_attn_kv)
+        entity_attention_masks = None
         if fg_share_flag or bg_share_flag:
-            saved_key, saved_value, attention_mask = self.get_expanded_key_value(
+            saved_key, saved_value, attention_mask, entity_attention_masks = self.get_expanded_key_value(
                 (image_rotary_emb[0][self.text_seq_len:], image_rotary_emb[1][self.text_seq_len:]),
                 bg_share_flag,
                 fg_share_flag,
                 timestep_ind,
                 query.device,
+                entity_routing_mode=entity_routing_mode,
                 **spatial_kwargs)
             component_state = spatial_kwargs.get("component_audit_state")
             if component_state is not None and fg_share_flag:
@@ -429,6 +549,50 @@ class CharaConsistAttnProcessor2_0:
                 )
             key = torch.cat([key, saved_key], dim=2)
             value = torch.cat([value, saved_value], dim=2)
+            if fg_share_flag:
+                attention_mask = apply_role_attention_bias(
+                    attention_mask,
+                    self.text_seq_len,
+                    self.visual_seq_len,
+                    self.role_spans,
+                    spatial_kwargs.get("role_maps", {}),
+                    role_action_bias_strength,
+                    spatial_kwargs.get("role_action_trace_state"),
+                )
+
+        if action_binding_active:
+            attention_mask = apply_character_action_bias(
+                attention_mask,
+                self.text_seq_len,
+                self.visual_seq_len,
+                self.binding_spans.get("actions", {}),
+                spatial_kwargs.get("binding_character_maps", {}),
+                action_binding_beta,
+                action_binding_gamma,
+                query,
+                key,
+                spatial_kwargs.get("action_binding_trace_state"),
+                timestep_ind,
+                self.block_index,
+            )
+
+        routing_trace_state = spatial_kwargs.get("entity_routing_trace_state")
+        if routing_trace_state is not None and entity_attention_masks is not None:
+            wrong_entity_mask, same_entity_mask = entity_attention_masks
+            mass_record = measure_entity_attention_mass(
+                query,
+                key,
+                attention_mask,
+                wrong_entity_mask,
+                same_entity_mask,
+            )
+            mass_record.update({
+                "timestep": int(timestep_ind),
+                "block": int(self.block_index),
+            })
+            routing_trace_state.setdefault("attention_mass_records", []).append(
+                mass_record
+            )
 
         hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False)
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
@@ -490,6 +654,7 @@ def reset_attn_processor(pipe, size, fg_share_freq=2, bg_share_freq=1):
                 fg_share_flag=(block_ind % fg_share_freq == 0),
                 bg_share_flag=(block_ind % bg_share_freq == 0),
             )
+            new_attn_processors[name].block_index = block_ind
             print(f"reset attn processor of layer {name}")
             reset_num += 1
         else:
@@ -498,7 +663,9 @@ def reset_attn_processor(pipe, size, fg_share_freq=2, bg_share_freq=1):
     print(f"{reset_num} layers have been reset")
 
 
-def set_text_spans(pipe, bg_len, action_start, real_len):
+def set_text_spans(
+    pipe, bg_len, action_start, real_len, role_spans=None, binding_spans=None
+):
     attn_processors = pipe.transformer.attn_processors
     reset_num = 0
     for name in attn_processors:
@@ -507,6 +674,11 @@ def set_text_spans(pipe, bg_len, action_start, real_len):
             processor.bg_len = bg_len
             processor.action_start = min(action_start, real_len)
             processor.real_len = real_len
+            processor.role_spans = dict(role_spans or {})
+            processor.binding_spans = {
+                kind: dict((binding_spans or {}).get(kind, {}))
+                for kind in ("characters", "actions")
+            }
             reset_num += 1
     print(
         f"{reset_num} layers' text spans have been reset to "
@@ -532,7 +704,7 @@ def remove_small_holes_and_points(mask_tensor):
     results = torch.stack(results, dim=0).to(mask_tensor.device, dtype=mask_tensor.dtype)
     return results
 
-def get_curr_fg_mask_and_action_scores(pipe):
+def get_curr_fg_mask_action_and_role_maps(pipe):
     attn_processors = pipe.transformer.attn_processors
     all_attn_weights = dict(bg=[], fg=[], action=[])
     for name in attn_processors:
@@ -540,13 +712,38 @@ def get_curr_fg_mask_and_action_scores(pipe):
         if isinstance(processor, CharaConsistAttnProcessor2_0):
             saved_attns = processor.attn_weights
             for k in saved_attns:
-                all_attn_weights[k].append(saved_attns[k])
+                all_attn_weights.setdefault(k, []).append(saved_attns[k])
             processor.attn_weights = dict()
     bg_attns = sum(all_attn_weights["bg"]) / len(all_attn_weights["bg"])
     fg_attns = sum(all_attn_weights["fg"]) / len(all_attn_weights["fg"])
     action_attns = sum(all_attn_weights["action"]) / len(all_attn_weights["action"])
     foreground_mask = remove_small_holes_and_points(bg_attns <= fg_attns)
     action_scores = normalize_action_attention(action_attns, foreground_mask)
+    role_attention = {
+        key.removeprefix("role_"): sum(values) / len(values)
+        for key, values in all_attn_weights.items()
+        if key.startswith("role_") and values
+    }
+    role_maps = build_soft_role_maps(role_attention, foreground_mask)
+    character_attention = {
+        key.removeprefix("binding_character_"): sum(values) / len(values)
+        for key, values in all_attn_weights.items()
+        if key.startswith("binding_character_") and values
+    }
+    action_binding_attention = {
+        key.removeprefix("binding_action_"): sum(values) / len(values)
+        for key, values in all_attn_weights.items()
+        if key.startswith("binding_action_") and values
+    }
+    binding_maps = {
+        "characters": build_character_maps(character_attention, foreground_mask),
+        "actions": action_binding_attention,
+    }
+    return foreground_mask, action_scores, role_maps, binding_maps
+
+
+def get_curr_fg_mask_and_action_scores(pipe):
+    foreground_mask, action_scores, _, _ = get_curr_fg_mask_action_and_role_maps(pipe)
     return foreground_mask, action_scores
 
 

@@ -14,8 +14,14 @@ from diffusers.utils.torch_utils import randn_tensor
 from characonsist.diagnostics.components import normalize_consistency_mode
 
 from .attention_processor_characonsist import (
-    get_curr_fg_mask_and_action_scores,
+    get_curr_fg_mask_action_and_role_maps,
     get_cross_sim,
+)
+from .entity_routing import (
+    build_entity_labels,
+    get_entity_restricted_matches,
+    should_apply_entity_matching,
+    should_build_entity_labels,
 )
 
 
@@ -78,6 +84,10 @@ class CharaConsistPipeline(FluxPipeline):
         interpolate_end_step: int = 31,
         interpolate_weight: float = 0.8,
         action_gate_strength: float = 1.0,
+        role_action_bias_strength: float = 0.0,
+        action_binding_beta: float = 0.0,
+        action_binding_gamma: float = 0.0,
+        entity_routing_mode: str = "off",
         sim_thr = 0.5,
         save_mask_point_step: int = 10,
         save_all_steps: bool = False
@@ -89,6 +99,17 @@ class CharaConsistPipeline(FluxPipeline):
             raise ValueError(
                 "action_gate_strength must be between 0 and 1, "
                 f"got {action_gate_strength}."
+            )
+        if role_action_bias_strength < 0.0:
+            raise ValueError(
+                "role_action_bias_strength must be non-negative, "
+                f"got {role_action_bias_strength}."
+            )
+        if action_binding_beta < 0.0 or action_binding_gamma < 0.0:
+            raise ValueError("action-binding beta and gamma must be non-negative.")
+        if entity_routing_mode not in {"off", "hard"}:
+            raise ValueError(
+                f"entity_routing_mode must be 'off' or 'hard', got {entity_routing_mode!r}."
             )
         consistency_mode = normalize_consistency_mode(consistency_mode, use_interpolate)
         enable_identity_attention = consistency_mode != "prompt_only"
@@ -226,6 +247,17 @@ class CharaConsistPipeline(FluxPipeline):
                 attn_out_interpolate = attn_out_interpolate,
                 interpolate_weight_dict=interpolate_weight_dict,
                 action_gate_strength=action_gate_strength,
+                role_action_bias_strength=role_action_bias_strength,
+                action_binding_beta=action_binding_beta,
+                action_binding_gamma=action_binding_gamma,
+                action_binding_active=(
+                    not is_id
+                    and not is_pre_run
+                    and i >= attn_start_step
+                    and i < attn_end_step
+                    and (action_binding_beta > 0.0 or action_binding_gamma > 0.0)
+                ),
+                entity_routing_mode=entity_routing_mode,
                 spatial_kwargs=spatial_kwargs)
 
         # 6. Denoising loop
@@ -252,19 +284,66 @@ class CharaConsistPipeline(FluxPipeline):
                 )[0]
 
                 if self.joint_attention_kwargs["save_attn_weight"]:
-                    curr_fg_mask, action_scores = get_curr_fg_mask_and_action_scores(self)
+                    curr_fg_mask, action_scores, role_maps, binding_maps = (
+                        get_curr_fg_mask_action_and_role_maps(self)
+                    )
                     if save_all_steps:
                         if "all_fg_masks" not in spatial_kwargs:
                             spatial_kwargs["all_fg_masks"] = dict()
                         spatial_kwargs["all_fg_masks"][i] = curr_fg_mask.clone()
                     spatial_kwargs["curr_fg_mask"] = curr_fg_mask
                     spatial_kwargs["action_scores"] = action_scores
+                    if role_maps and (is_pre_run or "role_maps" not in spatial_kwargs):
+                        spatial_kwargs["role_maps"] = role_maps
+                    if binding_maps["characters"] and (
+                        is_pre_run or "binding_character_maps" not in spatial_kwargs
+                    ):
+                        spatial_kwargs["binding_character_maps"] = binding_maps["characters"]
+                    # Pre-runs collect attention maps at every step through the
+                    # correspondence step. Early noisy steps can be spatially
+                    # uniform, so only validate and freeze routing labels at the
+                    # step where cross-similarity matching actually consumes them.
+                    if (
+                        should_build_entity_labels(
+                            entity_routing_mode, i, save_mask_point_step
+                        )
+                        and binding_maps["characters"]
+                    ):
+                        entity_labels = build_entity_labels(
+                            binding_maps["characters"], curr_fg_mask
+                        )
+                        if is_id:
+                            spatial_kwargs["id_entity_labels"] = entity_labels
+                        elif is_pre_run:
+                            spatial_kwargs["curr_entity_labels"] = entity_labels
+                    if binding_maps["actions"]:
+                        spatial_kwargs["binding_action_maps"] = binding_maps["actions"]
                     if update_bg:
                         spatial_kwargs["id_bg_mask"] = copy.deepcopy(~curr_fg_mask)
                         
                 if self.joint_attention_kwargs["save_cross_sim"]:
                     avg_cross_sim = get_cross_sim(self)
-                    max_sim, argmax_indices = torch.max(avg_cross_sim, dim=-1)
+                    if should_apply_entity_matching(
+                        entity_routing_mode, is_pre_run, i, save_mask_point_step
+                    ):
+                        (
+                            id_fg_inds,
+                            curr_fg_inds,
+                            max_sim,
+                            argmax_indices,
+                            match_report,
+                        ) = get_entity_restricted_matches(
+                            avg_cross_sim,
+                            spatial_kwargs["id_entity_labels"],
+                            spatial_kwargs["curr_entity_labels"],
+                            sim_thr,
+                        )
+                        spatial_kwargs["entity_routing_match_report"] = match_report
+                        trace = spatial_kwargs.get("entity_routing_trace_state")
+                        if trace is not None:
+                            trace.setdefault("match_reports", []).append(match_report)
+                    else:
+                        max_sim, argmax_indices = torch.max(avg_cross_sim, dim=-1)
                     if save_all_steps:
                         if "all_max_sims" not in spatial_kwargs:
                             spatial_kwargs["all_max_sims"] = dict()
@@ -273,12 +352,13 @@ class CharaConsistPipeline(FluxPipeline):
                         spatial_kwargs["all_argmax_indices"][i] = argmax_indices.clone()
                         
                     if i == save_mask_point_step:
-                        id_fg_inds, curr_fg_inds = get_shared_fg_mask(
-                            spatial_kwargs["id_fg_mask"], 
-                            spatial_kwargs["curr_fg_mask"], 
-                            argmax_indices,
-                            max_sim>sim_thr
-                        )
+                        if entity_routing_mode != "hard":
+                            id_fg_inds, curr_fg_inds = get_shared_fg_mask(
+                                spatial_kwargs["id_fg_mask"],
+                                spatial_kwargs["curr_fg_mask"],
+                                argmax_indices,
+                                max_sim > sim_thr,
+                            )
                         spatial_kwargs.update(
                             id_fg_inds = id_fg_inds,
                             curr_fg_inds = curr_fg_inds,

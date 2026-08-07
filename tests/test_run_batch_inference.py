@@ -186,3 +186,90 @@ class BatchInferenceTests(unittest.TestCase):
                         "bg_fg", "scene", MARKER_NAME,
                     ).is_file()
                 )
+
+    def test_main_runs_role_bias_control_with_matched_seed_and_gate_disabled(self):
+        calls = []
+
+        def run_prompt_file(_pipe, args):
+            Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+            calls.append((
+                args.role_action_bias_strength,
+                args.action_gate_strength,
+                args.consistency_mode,
+                args.seed,
+            ))
+
+        fake_inference = types.SimpleNamespace(
+            initialize_pipeline=lambda _args: object(),
+            reset_runtime_state=lambda _pipe, _args: None,
+            run_prompt_file=run_prompt_file,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            prompts = root / "prompts"
+            prompts.mkdir()
+            (prompts / "scene.txt").write_text("bg#people#[S]man[/S] [A]holds[/A] [O]mug[/O]\n")
+            argv = [
+                "run_batch_inference.py",
+                "--root", str(root),
+                "--prompts-dir", str(prompts),
+                "--model-path", "model",
+                "--init-mode", "0",
+                "--results-dir", str(root / "results"),
+                "--summary", str(root / "summary.json"),
+                "--role-action-bias-strengths", "0,1",
+                "--seeds", "2025",
+            ]
+            with patch.dict(sys.modules, {"inference": fake_inference}), patch.object(sys, "argv", argv):
+                self.assertEqual(main(), 0)
+
+            self.assertEqual(
+                calls,
+                [(0.0, 0.0, "full", 2025), (1.0, 0.0, "full", 2025)],
+            )
+
+    def test_main_runs_entity_routing_factorial(self):
+        calls = []
+
+        def run_prompt_file(_pipe, args):
+            Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+            calls.append((
+                args.entity_routing_mode,
+                args.action_binding_beta,
+                args.action_binding_gamma,
+                args.action_gate_strength,
+            ))
+
+        fake_inference = types.SimpleNamespace(
+            initialize_pipeline=lambda _args: object(),
+            reset_runtime_state=lambda _pipe, _args: None,
+            run_prompt_file=run_prompt_file,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            prompts = root / "prompts"
+            prompts.mkdir()
+            (prompts / "scene.txt").write_text(
+                "bg#[C1]man[/C1] and [C2]woman[/C2]#[A1]man drinks[/A1]\n"
+            )
+            argv = [
+                "run_batch_inference.py",
+                "--root", str(root),
+                "--prompts-dir", str(prompts),
+                "--model-path", "model",
+                "--init-mode", "0",
+                "--results-dir", str(root / "results"),
+                "--summary", str(root / "summary.json"),
+                "--entity-routing-modes", "off,hard",
+                "--action-binding-conditions", "0:0,1:0.5",
+                "--seeds", "2025",
+            ]
+            with patch.dict(sys.modules, {"inference": fake_inference}), patch.object(sys, "argv", argv):
+                self.assertEqual(main(), 0)
+
+            self.assertEqual(calls, [
+                ("off", 0.0, 0.0, 0.0),
+                ("off", 1.0, 0.5, 0.0),
+                ("hard", 0.0, 0.0, 0.0),
+                ("hard", 1.0, 0.5, 0.0),
+            ])

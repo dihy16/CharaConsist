@@ -12,11 +12,25 @@ parser.add_argument(
     default=None,
     help="Component ablation: prompt only, identity attention only, or full CharaConsist.",
 )
+parser.add_argument("--action-binding-beta", "--action_binding_beta", type=float, default=0.0)
+parser.add_argument("--action-binding-gamma", "--action_binding_gamma", type=float, default=0.0)
+parser.add_argument(
+    "--entity-routing-mode", "--entity_routing_mode",
+    choices=("off", "hard"),
+    default="off",
+    help="Restrict identity correspondence, K/V access, and merge to C1/C2 owners.",
+)
 parser.add_argument(
     "--action_gate_strength",
     type=float,
     default=1.0,
     help="Action-attention suppression for adaptive token merge (0 disables, 1 is full gating).",
+)
+parser.add_argument(
+    "--role-action-bias-strength", "--role_action_bias_strength",
+    type=float,
+    default=0.0,
+    help="Finite role-localized attention-logit bias (0 is an exact no-op).",
 )
 parser.add_argument("--share_bg", action='store_true')
 parser.add_argument("--save_mask", action='store_true')
@@ -39,7 +53,11 @@ from models.attention_processor_characonsist import (
     reset_id_bank,
 )
 from models.pipeline_characonsist import CharaConsistPipeline
-from characonsist.prompts import build_prompt_and_spans
+from characonsist.prompts import (
+    build_prompt_and_spans,
+    build_prompt_spans_and_roles,
+    build_prompt_spans_roles_and_bindings,
+)
 from characonsist.diagnostics.points import save_dense_correspondence, tensor_to_numpy
 from characonsist.diagnostics.action_attention import save_action_attention_artifacts
 from characonsist.diagnostics.components import (
@@ -49,6 +67,19 @@ from characonsist.diagnostics.components import (
     save_component_trace,
 )
 from characonsist.diagnostics.merge import save_frame_merge_diagnostics, save_prompt_gate_audit
+from characonsist.diagnostics.role_action import (
+    save_role_action_maps,
+    save_role_action_trace,
+)
+from characonsist.diagnostics.action_binding import (
+    save_action_binding_action_maps,
+    save_action_binding_preflight,
+    save_action_binding_trace,
+)
+from characonsist.diagnostics.entity_routing import (
+    save_entity_label_preflight,
+    save_entity_routing_trace,
+)
 
 
 def configure_cuda(gpu_ids):
@@ -97,11 +128,20 @@ def modify_prompt_and_get_length(bg, fg, act, pipe):
     """Backward-compatible wrapper returning the new cumulative spans."""
     return build_prompt_and_spans(bg, fg, act, pipe)
 
+
+def modify_prompt_get_spans_and_roles(bg, fg, act, pipe):
+    return build_prompt_spans_and_roles(bg, fg, act, pipe)
+
+
+def modify_prompt_get_all_spans(bg, fg, act, pipe):
+    return build_prompt_spans_roles_and_bindings(bg, fg, act, pipe)
+
 def load_prompt_file(pipe, file_path):
     with open(file_path, "r") as f:
         all_lines = f.readlines()
     all_prompt_info = []
     curr_prompts, curr_bg_len, curr_action_start, curr_real_len = [], [], [], []
+    curr_role_spans, curr_binding_spans = [], []
     for line_number, line in enumerate(all_lines, start=1):
         prompt = line.strip()
         if len(prompt) > 0:
@@ -111,35 +151,40 @@ def load_prompt_file(pipe, file_path):
                     f"Invalid prompt at line {line_number}: expected background#foreground#action."
                 )
             bg, fg, act = prompt_parts
-            prompt, bg_len, action_start, real_len = modify_prompt_and_get_length(
+            prompt, bg_len, action_start, real_len, role_spans, binding_spans = modify_prompt_get_all_spans(
                 bg, fg, act, pipe
             )
             curr_prompts.append(prompt)
             curr_bg_len.append(bg_len)
             curr_action_start.append(action_start)
             curr_real_len.append(real_len)
+            curr_role_spans.append(role_spans)
+            curr_binding_spans.append(binding_spans)
         else:
             if curr_prompts:
                 all_prompt_info.append(
-                    (curr_prompts, curr_bg_len, curr_action_start, curr_real_len)
+                    (curr_prompts, curr_bg_len, curr_action_start, curr_real_len, curr_role_spans, curr_binding_spans)
                 )
             curr_prompts, curr_bg_len, curr_action_start, curr_real_len = [], [], [], []
+            curr_role_spans, curr_binding_spans = [], []
     if len(curr_prompts) > 0:
         all_prompt_info.append(
-            (curr_prompts, curr_bg_len, curr_action_start, curr_real_len)
+            (curr_prompts, curr_bg_len, curr_action_start, curr_real_len, curr_role_spans, curr_binding_spans)
         )
     return all_prompt_info
 
 def load_mix_prompt_file(pipe, file_path):
     scenes = load_prompt_file(pipe, file_path)
     story_prompts, story_bg_lens = [], []
-    story_action_starts, story_real_lens, story_meta_info = [], [], []
-    for scene_ind, (prompts, bg_lens, action_starts, real_lens) in enumerate(scenes):
+    story_action_starts, story_real_lens, story_role_spans, story_binding_spans, story_meta_info = [], [], [], [], []
+    for scene_ind, (prompts, bg_lens, action_starts, real_lens, role_spans, binding_spans) in enumerate(scenes):
         for prompt_ind, prompt in enumerate(prompts):
             story_prompts.append(prompt)
             story_bg_lens.append(bg_lens[prompt_ind])
             story_action_starts.append(action_starts[prompt_ind])
             story_real_lens.append(real_lens[prompt_ind])
+            story_role_spans.append(role_spans[prompt_ind])
+            story_binding_spans.append(binding_spans[prompt_ind])
             story_meta_info.append(
                 dict(
                     update_bg=(scene_ind > 0 and prompt_ind == 0),
@@ -150,6 +195,8 @@ def load_mix_prompt_file(pipe, file_path):
         story_bg_lens,
         story_action_starts,
         story_real_lens,
+        story_role_spans,
+        story_binding_spans,
         story_meta_info,
     )
 
@@ -252,28 +299,98 @@ def finalize_component_audit(spatial_kwargs, mode, frame):
     state = spatial_kwargs.pop("component_audit_state", None)
     return finalize_component_state(state, mode, frame)
 
+
+def prepare_role_action_audit(spatial_kwargs, frame, role_spans, strength):
+    spatial_kwargs["role_action_trace_state"] = {
+        "frame": frame,
+        "strength": float(strength),
+        "role_spans": {key: list(value) for key, value in role_spans.items()},
+    }
+
+
+def finalize_role_action_audit(spatial_kwargs):
+    return spatial_kwargs.pop("role_action_trace_state", None)
+
+
+def prepare_action_binding_audit(spatial_kwargs, frame, binding_spans, beta, gamma):
+    spatial_kwargs["action_binding_trace_state"] = {
+        "frame": frame,
+        "beta": float(beta),
+        "gamma": float(gamma),
+        "action_spans": {
+            key: list(value) for key, value in binding_spans.get("actions", {}).items()
+        },
+    }
+
+
+def finalize_action_binding_audit(spatial_kwargs):
+    return spatial_kwargs.pop("action_binding_trace_state", None)
+
+
+def expected_entity_routing_invocations(pipe, routing_steps=40):
+    """Count hard-routing mask applications from the configured attention topology."""
+    foreground_processors = sum(
+        bool(getattr(processor, "fg_share_flag", False))
+        for processor in pipe.transformer.attn_processors.values()
+    )
+    return foreground_processors * routing_steps
+
+
 def run_prompt_file(pipe, args):
     consistency_mode = normalize_consistency_mode(
         getattr(args, "consistency_mode", None), getattr(args, "use_interpolate", False)
     )
     args.consistency_mode = consistency_mode
     args.use_interpolate = consistency_mode == "full"
+    role_strength = getattr(args, "role_action_bias_strength", 0.0)
+    binding_beta = getattr(args, "action_binding_beta", 0.0)
+    binding_gamma = getattr(args, "action_binding_gamma", 0.0)
+    binding_enabled = binding_beta > 0.0 or binding_gamma > 0.0
+    routing_mode = getattr(args, "entity_routing_mode", "off")
+    routing_enabled = routing_mode == "hard"
+    routing_expected_invocations = expected_entity_routing_invocations(pipe)
+    if role_strength > 0.0 and consistency_mode != "full":
+        raise ValueError("Role-action bias requires consistency_mode='full'.")
+    if role_strength > 0.0 and args.action_gate_strength != 0.0:
+        raise ValueError("Set action_gate_strength=0 to isolate the role-action ablation.")
+    if binding_enabled and consistency_mode != "full":
+        raise ValueError("Character-action binding requires consistency_mode='full'.")
+    if binding_enabled and (args.action_gate_strength != 0.0 or role_strength != 0.0):
+        raise ValueError(
+            "Set action_gate_strength=0 and role_action_bias_strength=0 to isolate action binding."
+        )
+    if routing_enabled and consistency_mode != "full":
+        raise ValueError("Hard entity routing requires consistency_mode='full'.")
+    if routing_enabled and (args.action_gate_strength != 0.0 or role_strength != 0.0):
+        raise ValueError(
+            "Set action_gate_strength=0 and role_action_bias_strength=0 to isolate entity routing."
+        )
     pipe_kwargs = dict(
         height = args.height,
         width = args.width,
         use_interpolate = args.use_interpolate,
         consistency_mode = consistency_mode,
         action_gate_strength = args.action_gate_strength,
+        role_action_bias_strength = role_strength,
+        action_binding_beta=binding_beta,
+        action_binding_gamma=binding_gamma,
+        entity_routing_mode=routing_mode,
         share_bg = args.share_bg,
         save_all_steps = args.save_all_steps
     )
 
     if args.mix_mode:
-        prompts, bg_lens, action_starts, real_lens, meta_info = load_mix_prompt_file(
+        prompts, bg_lens, action_starts, real_lens, role_spans, binding_spans, meta_info = load_mix_prompt_file(
             pipe, args.prompts_file
         )
         if len(prompts) == 0:
             raise ValueError("No prompts found in prompts_file.")
+        if routing_enabled:
+            for frame, spans in enumerate(binding_spans):
+                if set(spans.get("characters", {})) != {"1", "2"}:
+                    raise ValueError(
+                        f"Prompt frame {frame} requires [C1] and [C2] tags for hard routing."
+                    )
 
         os.makedirs(args.out_dir, exist_ok=True)
         if args.save_mask:
@@ -285,11 +402,23 @@ def run_prompt_file(pipe, args):
 
         print("#" * 50)
         print("Generating ID image ...")
-        set_text_spans(pipe, bg_lens[0], action_starts[0], real_lens[0])
+        set_text_spans(pipe, bg_lens[0], action_starts[0], real_lens[0], role_spans[0], binding_spans[0])
         id_images, id_spatial_kwargs = pipe(
             id_prompt, is_id=True, generator=torch.Generator("cpu").manual_seed(args.seed), **pipe_kwargs
         )
         id_fg_mask = id_spatial_kwargs["curr_fg_mask"]
+        id_routing_report = {}
+        if routing_enabled:
+            if set(binding_spans[0].get("characters", {})) != {"1", "2"}:
+                raise ValueError("Identity prompt requires [C1] and [C2] tags for hard routing.")
+            id_entity_labels = id_spatial_kwargs.get("id_entity_labels")
+            if id_entity_labels is None:
+                raise RuntimeError("Identity generation did not produce C1/C2 entity labels.")
+            id_routing_report = save_entity_label_preflight(
+                id_images[0], id_entity_labels, id_fg_mask, args.out_dir, "identity"
+            )
+            if id_routing_report["status"] != "pass":
+                raise RuntimeError("Identity entity-map preflight failed.")
         id_images[0].save(f"{args.out_dir}/id.jpg")
         if getattr(args, "save_action_maps", False):
             save_action_map(
@@ -307,8 +436,13 @@ def run_prompt_file(pipe, args):
                     )
 
         spatial_kwargs = dict(id_fg_mask=id_fg_mask, id_bg_mask=~id_fg_mask)
+        if routing_enabled:
+            spatial_kwargs["id_entity_labels"] = id_entity_labels
         frame_audits = []
         frame_component_traces = []
+        frame_role_traces = []
+        frame_binding_traces = []
+        frame_routing_traces = []
         print("#" * 50)
         print("Generating frame images ...")
         for ind, prompt in enumerate(frm_prompts):
@@ -319,7 +453,15 @@ def run_prompt_file(pipe, args):
                 bg_lens[ind + 1],
                 action_starts[ind + 1],
                 real_lens[ind + 1],
+                role_spans[ind + 1],
+                binding_spans[ind + 1],
             )
+            if role_strength > 0.0 and not {"subject", "predicate", "object"}.issubset(role_spans[ind + 1]):
+                raise ValueError(f"Frame {ind} needs [S], [A], and [O] tags for role-action bias.")
+            spatial_kwargs.pop("role_maps", None)
+            spatial_kwargs.pop("binding_character_maps", None)
+            spatial_kwargs.pop("curr_entity_labels", None)
+            spatial_kwargs.pop("entity_routing_match_report", None)
             point_snapshot = None
             if consistency_mode != "prompt_only":
                 pre_images, spatial_kwargs = pipe(
@@ -331,8 +473,45 @@ def run_prompt_file(pipe, args):
                 )
                 point_snapshot = snapshot_point_tracking(spatial_kwargs) if args.save_points else None
                 pre_images[0].save(f"{args.out_dir}/{ind}_pre.jpg")
+                if binding_spans[ind + 1].get("characters"):
+                    report = save_action_binding_preflight(
+                        pre_images[0],
+                        spatial_kwargs.get("binding_character_maps", {}),
+                        spatial_kwargs["curr_fg_mask"],
+                        args.out_dir,
+                    )
+                    if binding_enabled and report["status"] != "pass":
+                        raise RuntimeError("Character-map preflight failed; see map_preflight.json.")
+                if routing_enabled:
+                    curr_labels = spatial_kwargs.get("curr_entity_labels")
+                    if curr_labels is None:
+                        raise RuntimeError(f"Frame {ind} did not produce C1/C2 entity labels.")
+                    curr_report = save_entity_label_preflight(
+                        pre_images[0], curr_labels, spatial_kwargs["curr_fg_mask"],
+                        args.out_dir, f"frame_{ind}",
+                    )
+                    if curr_report["status"] != "pass":
+                        raise RuntimeError(f"Frame {ind} entity-map preflight failed.")
+            if binding_enabled:
+                if set(binding_spans[ind + 1].get("characters", {})) != {"1", "2"}:
+                    raise ValueError(f"Frame {ind} requires [C1] and [C2] identity tags.")
+            if routing_enabled and set(binding_spans[ind + 1].get("characters", {})) != {"1", "2"}:
+                raise ValueError(f"Frame {ind} requires [C1] and [C2] identity tags.")
             prepare_merge_audit(spatial_kwargs, args)
             prepare_component_audit(spatial_kwargs)
+            if role_spans[ind + 1]:
+                prepare_role_action_audit(spatial_kwargs, ind, role_spans[ind + 1], role_strength)
+            if binding_spans[ind + 1].get("actions"):
+                prepare_action_binding_audit(
+                    spatial_kwargs, ind, binding_spans[ind + 1], binding_beta, binding_gamma
+                )
+            if routing_enabled:
+                spatial_kwargs["entity_routing_trace_state"] = {
+                    "frame": ind,
+                    "mode": routing_mode,
+                    "current_map_report": curr_report,
+                    "pre_run_match_report": spatial_kwargs.get("entity_routing_match_report"),
+                }
             images, spatial_kwargs = pipe(
                 prompt,
                 generator=torch.Generator("cpu").manual_seed(args.seed),
@@ -343,6 +522,27 @@ def run_prompt_file(pipe, args):
             frame_component_traces.append(
                 finalize_component_audit(spatial_kwargs, consistency_mode, ind)
             )
+            role_trace = finalize_role_action_audit(spatial_kwargs)
+            if role_trace is not None:
+                frame_role_traces.append(role_trace)
+            binding_trace = finalize_action_binding_audit(spatial_kwargs)
+            if binding_trace is not None:
+                frame_binding_traces.append(binding_trace)
+            routing_trace = spatial_kwargs.pop("entity_routing_trace_state", None)
+            if routing_trace is not None:
+                frame_routing_traces.append(routing_trace)
+            if binding_spans[ind + 1].get("actions") and spatial_kwargs.get("binding_action_maps"):
+                save_action_binding_action_maps(
+                    images[0],
+                    spatial_kwargs["binding_action_maps"],
+                    spatial_kwargs["curr_fg_mask"],
+                    args.out_dir,
+                    ind,
+                )
+            if role_spans[ind + 1] and spatial_kwargs.get("role_maps"):
+                save_role_action_maps(
+                    images[0], spatial_kwargs["role_maps"], args.out_dir, ind
+                )
             frame_audit = finalize_merge_audit(spatial_kwargs, args.out_dir, ind, args)
             if frame_audit is not None:
                 frame_audits.append(frame_audit)
@@ -385,6 +585,21 @@ def run_prompt_file(pipe, args):
         save_component_trace(
             args.out_dir, consistency_mode, args.seed, frame_component_traces
         )
+        if frame_role_traces:
+            save_role_action_trace(args.out_dir, args.seed, role_strength, frame_role_traces)
+        if frame_binding_traces:
+            save_action_binding_trace(
+                args.out_dir, args.seed, binding_beta, binding_gamma, frame_binding_traces
+            )
+        if routing_enabled:
+            save_entity_routing_trace(
+                args.out_dir,
+                args.seed,
+                routing_mode,
+                id_routing_report,
+                frame_routing_traces,
+                routing_expected_invocations,
+            )
         reset_id_bank(pipe)
         mix_prompt_parts = [part for scene in parse_prompt_scenes(args.prompts_file) for part in scene]
         save_story_visualization(args.out_dir, mix_prompt_parts)
@@ -393,7 +608,15 @@ def run_prompt_file(pipe, args):
         all_prompt_info = load_prompt_file(pipe, args.prompts_file)
         all_prompt_scenes = parse_prompt_scenes(args.prompts_file)
 
-        for prompt_ind, (prompts, bg_lens, action_starts, real_lens) in enumerate(all_prompt_info):
+        for prompt_ind, (
+            prompts, bg_lens, action_starts, real_lens, role_spans, binding_spans
+        ) in enumerate(all_prompt_info):
+            if routing_enabled:
+                for frame, spans in enumerate(binding_spans):
+                    if set(spans.get("characters", {})) != {"1", "2"}:
+                        raise ValueError(
+                            f"Prompt frame {frame} requires [C1] and [C2] tags for hard routing."
+                        )
             out_dir = os.path.join(args.out_dir, f"prompt_{prompt_ind}")
             os.makedirs(out_dir, exist_ok=True)
             if args.save_mask:
@@ -405,10 +628,24 @@ def run_prompt_file(pipe, args):
             # ID Gen
             print("#" * 50)
             print("Generating ID image ...")
-            set_text_spans(pipe, bg_lens[0], action_starts[0], real_lens[0])
+            set_text_spans(
+                pipe, bg_lens[0], action_starts[0], real_lens[0], role_spans[0], binding_spans[0]
+            )
             id_images, id_spatial_kwargs = pipe(
                 id_prompt, is_id=True, generator = torch.Generator("cpu").manual_seed(args.seed), **pipe_kwargs)
             id_fg_mask = id_spatial_kwargs["curr_fg_mask"]
+            id_routing_report = {}
+            if routing_enabled:
+                if set(binding_spans[0].get("characters", {})) != {"1", "2"}:
+                    raise ValueError("Identity prompt requires [C1] and [C2] tags for hard routing.")
+                id_entity_labels = id_spatial_kwargs.get("id_entity_labels")
+                if id_entity_labels is None:
+                    raise RuntimeError("Identity generation did not produce C1/C2 entity labels.")
+                id_routing_report = save_entity_label_preflight(
+                    id_images[0], id_entity_labels, id_fg_mask, out_dir, "identity"
+                )
+                if id_routing_report["status"] != "pass":
+                    raise RuntimeError("Identity entity-map preflight failed.")
             id_images[0].save(f"{out_dir}/id.jpg")
             if getattr(args, "save_action_maps", False):
                 save_action_map(
@@ -423,8 +660,13 @@ def run_prompt_file(pipe, args):
 
             # Frame Gen
             spatial_kwargs = dict(id_fg_mask = id_fg_mask, id_bg_mask = ~id_fg_mask)
+            if routing_enabled:
+                spatial_kwargs["id_entity_labels"] = id_entity_labels
             frame_audits = []
             frame_component_traces = []
+            frame_role_traces = []
+            frame_binding_traces = []
+            frame_routing_traces = []
             print("#" * 50)
             print("Generating frame images ...")
             for ind, prompt in enumerate(frm_prompts):
@@ -433,21 +675,91 @@ def run_prompt_file(pipe, args):
                     bg_lens[1:][ind],
                     action_starts[1:][ind],
                     real_lens[1:][ind],
+                    role_spans[1:][ind],
+                    binding_spans[1:][ind],
                 )
+                if role_strength > 0.0 and not {"subject", "predicate", "object"}.issubset(role_spans[1:][ind]):
+                    raise ValueError(f"Frame {ind} needs [S], [A], and [O] tags for role-action bias.")
+                spatial_kwargs.pop("role_maps", None)
+                spatial_kwargs.pop("binding_character_maps", None)
+                spatial_kwargs.pop("curr_entity_labels", None)
+                spatial_kwargs.pop("entity_routing_match_report", None)
                 point_snapshot = None
                 if consistency_mode != "prompt_only":
                     pre_images, spatial_kwargs = pipe(
                         prompt, is_pre_run=True, generator = torch.Generator("cpu").manual_seed(args.seed), spatial_kwargs=spatial_kwargs, **pipe_kwargs)
                     point_snapshot = snapshot_point_tracking(spatial_kwargs) if args.save_points else None
                     pre_images[0].save(f"{out_dir}/{ind}_pre.jpg")
+                    if binding_spans[1:][ind].get("characters"):
+                        report = save_action_binding_preflight(
+                            pre_images[0],
+                            spatial_kwargs.get("binding_character_maps", {}),
+                            spatial_kwargs["curr_fg_mask"],
+                            out_dir,
+                        )
+                        if binding_enabled and report["status"] != "pass":
+                            raise RuntimeError(
+                                "Character-map preflight failed; see map_preflight.json."
+                            )
+                    if routing_enabled:
+                        curr_labels = spatial_kwargs.get("curr_entity_labels")
+                        if curr_labels is None:
+                            raise RuntimeError(f"Frame {ind} did not produce C1/C2 entity labels.")
+                        curr_report = save_entity_label_preflight(
+                            pre_images[0], curr_labels, spatial_kwargs["curr_fg_mask"],
+                            out_dir, f"frame_{ind}",
+                        )
+                        if curr_report["status"] != "pass":
+                            raise RuntimeError(f"Frame {ind} entity-map preflight failed.")
+                if binding_enabled:
+                    if set(binding_spans[1:][ind].get("characters", {})) != {"1", "2"}:
+                        raise ValueError(f"Frame {ind} requires [C1] and [C2] identity tags.")
+                if routing_enabled and set(binding_spans[1:][ind].get("characters", {})) != {"1", "2"}:
+                    raise ValueError(f"Frame {ind} requires [C1] and [C2] identity tags.")
                 prepare_merge_audit(spatial_kwargs, args)
                 prepare_component_audit(spatial_kwargs)
+                if role_spans[1:][ind]:
+                    prepare_role_action_audit(spatial_kwargs, ind, role_spans[1:][ind], role_strength)
+                if binding_spans[1:][ind].get("actions"):
+                    prepare_action_binding_audit(
+                        spatial_kwargs,
+                        ind,
+                        binding_spans[1:][ind],
+                        binding_beta,
+                        binding_gamma,
+                    )
+                if routing_enabled:
+                    spatial_kwargs["entity_routing_trace_state"] = {
+                        "frame": ind,
+                        "mode": routing_mode,
+                        "current_map_report": curr_report,
+                        "pre_run_match_report": spatial_kwargs.get("entity_routing_match_report"),
+                    }
                 images, spatial_kwargs = pipe(
                     prompt, generator = torch.Generator("cpu").manual_seed(args.seed), spatial_kwargs=spatial_kwargs, **pipe_kwargs)
                 images[0].save(f"{out_dir}/{ind}.jpg")
                 frame_component_traces.append(
                     finalize_component_audit(spatial_kwargs, consistency_mode, ind)
                 )
+                role_trace = finalize_role_action_audit(spatial_kwargs)
+                if role_trace is not None:
+                    frame_role_traces.append(role_trace)
+                binding_trace = finalize_action_binding_audit(spatial_kwargs)
+                if binding_trace is not None:
+                    frame_binding_traces.append(binding_trace)
+                routing_trace = spatial_kwargs.pop("entity_routing_trace_state", None)
+                if routing_trace is not None:
+                    frame_routing_traces.append(routing_trace)
+                if binding_spans[1:][ind].get("actions") and spatial_kwargs.get("binding_action_maps"):
+                    save_action_binding_action_maps(
+                        images[0],
+                        spatial_kwargs["binding_action_maps"],
+                        spatial_kwargs["curr_fg_mask"],
+                        out_dir,
+                        ind,
+                    )
+                if role_spans[1:][ind] and spatial_kwargs.get("role_maps"):
+                    save_role_action_maps(images[0], spatial_kwargs["role_maps"], out_dir, ind)
                 frame_audit = finalize_merge_audit(spatial_kwargs, out_dir, ind, args)
                 if frame_audit is not None:
                     frame_audits.append(frame_audit)
@@ -483,6 +795,21 @@ def run_prompt_file(pipe, args):
             save_component_trace(
                 out_dir, consistency_mode, args.seed, frame_component_traces
             )
+            if frame_role_traces:
+                save_role_action_trace(out_dir, args.seed, role_strength, frame_role_traces)
+            if frame_binding_traces:
+                save_action_binding_trace(
+                    out_dir, args.seed, binding_beta, binding_gamma, frame_binding_traces
+                )
+            if routing_enabled:
+                save_entity_routing_trace(
+                    out_dir,
+                    args.seed,
+                    routing_mode,
+                    id_routing_report,
+                    frame_routing_traces,
+                    routing_expected_invocations,
+                )
             reset_id_bank(pipe)
             if prompt_ind < len(all_prompt_scenes):
                 save_story_visualization(out_dir, all_prompt_scenes[prompt_ind])

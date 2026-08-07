@@ -21,6 +21,8 @@ from typing import List, Optional, Tuple
 
 from PIL import Image, ImageDraw, ImageFont
 
+from characonsist.prompts import parse_indexed_tags, parse_role_tags
+
 PromptPart = Tuple[str, str, str]
 
 ENVIRONMENT_HEADING = "[Environment]"
@@ -65,11 +67,14 @@ def format_environment_part(bg: str) -> str:
 
 
 def format_character_part(fg: str) -> str:
-    return _capitalize_first(_clean_part(fg))
+    clean_fg, _ = parse_indexed_tags(_clean_part(fg), "C")
+    return _capitalize_first(clean_fg)
 
 
 def format_action_shot(act: str) -> str:
-    return _capitalize_first(act.lstrip("#").strip())
+    indexed_action, _ = parse_indexed_tags(act.lstrip("#").strip(), "A")
+    clean_action, _ = parse_role_tags(indexed_action)
+    return _capitalize_first(clean_action)
 
 
 def find_prompt_file(folder: Path) -> Optional[Path]:

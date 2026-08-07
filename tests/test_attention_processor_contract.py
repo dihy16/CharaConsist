@@ -26,6 +26,8 @@ class AttentionProcessorContractTests(unittest.TestCase):
         self.assertEqual(set(signatures), class_names)
         for parameters in signatures.values():
             self.assertIn("action_gate_strength", parameters)
+            self.assertIn("role_action_bias_strength", parameters)
+            self.assertIn("entity_routing_mode", parameters)
 
 
 if __name__ == "__main__":

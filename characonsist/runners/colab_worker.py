@@ -19,9 +19,15 @@ from characonsist.runners.batch import (
 from run_colab_remote import ensure_model_snapshot
 from characonsist.experiments.conditions import (
     build_component_conditions,
+    build_action_binding_conditions,
+    build_entity_routing_conditions,
+    build_role_action_conditions,
     build_sweep_conditions,
     find_component_condition,
+    find_action_binding_condition,
+    find_entity_routing_condition,
     find_condition,
+    find_role_action_condition,
 )
 
 
@@ -61,6 +67,9 @@ def start(
     action_gate_strengths,
     seeds,
     consistency_modes=None,
+    role_action_bias_strengths=None,
+    action_binding_conditions=None,
+    entity_routing_modes=None,
 ):
     """Install dependencies and initialize the pipeline once in this kernel."""
     if STATE:
@@ -92,6 +101,10 @@ def start(
         use_interpolate=True,
         consistency_mode="full",
         action_gate_strength=0.0,
+        role_action_bias_strength=0.0,
+        action_binding_beta=0.0,
+        action_binding_gamma=0.0,
+        entity_routing_mode="off",
         save_action_maps=True,
         save_merge_maps=True,
         share_bg=False,
@@ -101,16 +114,40 @@ def start(
     prompt_files = sorted(prompts_dir.rglob("*.txt"))
     if not prompt_files:
         raise RuntimeError(f"No .txt files found in {prompts_dir}")
-    experiment_kind = "component_ablation" if consistency_modes else "lambda_sweep"
-    conditions = (
-        build_component_conditions(consistency_modes, seeds)
-        if consistency_modes
-        else build_sweep_conditions(action_gate_strengths, seeds)
-    )
+    selected = sum(bool(value) for value in (
+        consistency_modes,
+        role_action_bias_strengths,
+        entity_routing_modes or action_binding_conditions,
+    ))
+    if selected > 1:
+        raise ValueError("Choose exactly one optional experiment condition family.")
+    if entity_routing_modes:
+        experiment_kind = "entity_routing_ablation"
+        conditions = build_entity_routing_conditions(
+            entity_routing_modes,
+            action_binding_conditions or [(0.0, 0.0), (1.0, 0.5)],
+            seeds,
+        )
+    elif action_binding_conditions:
+        experiment_kind = "action_binding_ablation"
+        conditions = build_action_binding_conditions(action_binding_conditions, seeds)
+    elif role_action_bias_strengths:
+        experiment_kind = "role_action_ablation"
+        conditions = build_role_action_conditions(role_action_bias_strengths, seeds)
+    elif consistency_modes:
+        experiment_kind = "component_ablation"
+        conditions = build_component_conditions(consistency_modes, seeds)
+    else:
+        experiment_kind = "lambda_sweep"
+        conditions = build_sweep_conditions(action_gate_strengths, seeds)
     condition_stats = {
         condition.key: {
             "action_gate_strength": getattr(condition, "action_gate_strength", 0.0),
             "consistency_mode": getattr(condition, "consistency_mode", "full"),
+            "role_action_bias_strength": getattr(condition, "role_action_bias_strength", 0.0),
+            "action_binding_beta": getattr(condition, "beta", 0.0),
+            "action_binding_gamma": getattr(condition, "gamma", 0.0),
+            "entity_routing_mode": getattr(condition, "entity_routing_mode", "off"),
             "seed": condition.seed,
             "total": len(prompt_files),
             "generated": 0,
@@ -155,6 +192,10 @@ def _run_condition(relative_prompt_path, condition):
     run_args = argparse.Namespace(**vars(STATE["config"]))
     run_args.seed = condition.seed
     run_args.action_gate_strength = getattr(condition, "action_gate_strength", 0.0)
+    run_args.role_action_bias_strength = getattr(condition, "role_action_bias_strength", 0.0)
+    run_args.action_binding_beta = getattr(condition, "beta", 0.0)
+    run_args.action_binding_gamma = getattr(condition, "gamma", 0.0)
+    run_args.entity_routing_mode = getattr(condition, "entity_routing_mode", "off")
     run_args.consistency_mode = getattr(condition, "consistency_mode", "full")
     run_args.use_interpolate = run_args.consistency_mode == "full"
     record = success_record(prompt_file, inference_settings(run_args))
@@ -188,6 +229,10 @@ def _run_condition(relative_prompt_path, condition):
             "condition": condition.key,
             "action_gate_strength": run_args.action_gate_strength,
             "consistency_mode": run_args.consistency_mode,
+            "role_action_bias_strength": run_args.role_action_bias_strength,
+            "action_binding_beta": run_args.action_binding_beta,
+            "action_binding_gamma": run_args.action_binding_gamma,
+            "entity_routing_mode": run_args.entity_routing_mode,
             "seed": condition.seed,
             "exit_code": 1,
             "error": f"{type(exc).__name__}: {exc}",
@@ -217,6 +262,42 @@ def run_component(relative_prompt_path: str, consistency_mode: str, seed: int):
     if STATE["experiment_kind"] != "component_ablation":
         raise RuntimeError("worker was initialized for a lambda sweep")
     condition = find_component_condition(STATE["conditions"], consistency_mode, seed)
+    return _run_condition(relative_prompt_path, condition)
+
+
+def run_role_action(relative_prompt_path: str, role_action_bias_strength: float, seed: int):
+    """Run one matched full-mode role-action condition without reloading FLUX."""
+    if not STATE:
+        raise RuntimeError("worker has not been initialized")
+    if STATE["experiment_kind"] != "role_action_ablation":
+        raise RuntimeError("worker was not initialized for a role-action ablation")
+    condition = find_role_action_condition(
+        STATE["conditions"], role_action_bias_strength, seed
+    )
+    return _run_condition(relative_prompt_path, condition)
+
+
+def run_action_binding(relative_prompt_path: str, beta: float, gamma: float, seed: int):
+    """Run one matched full-mode character-conditioned action-binding condition."""
+    if not STATE:
+        raise RuntimeError("worker has not been initialized")
+    if STATE["experiment_kind"] != "action_binding_ablation":
+        raise RuntimeError("worker was not initialized for an action-binding ablation")
+    condition = find_action_binding_condition(STATE["conditions"], beta, gamma, seed)
+    return _run_condition(relative_prompt_path, condition)
+
+
+def run_entity_routing(
+    relative_prompt_path: str, mode: str, beta: float, gamma: float, seed: int
+):
+    """Run one matched K=2 hard/off routing condition."""
+    if not STATE:
+        raise RuntimeError("worker has not been initialized")
+    if STATE["experiment_kind"] != "entity_routing_ablation":
+        raise RuntimeError("worker was not initialized for an entity-routing ablation")
+    condition = find_entity_routing_condition(
+        STATE["conditions"], mode, beta, gamma, seed
+    )
     return _run_condition(relative_prompt_path, condition)
 
 

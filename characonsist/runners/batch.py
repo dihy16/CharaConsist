@@ -10,11 +10,19 @@ from pathlib import Path
 
 from characonsist.experiments.conditions import (
     ComponentCondition,
+    ActionBindingCondition,
+    EntityRoutingCondition,
+    RoleActionCondition,
     DEFAULT_ACTION_GATE_STRENGTHS,
     build_component_conditions,
+    build_action_binding_conditions,
+    build_entity_routing_conditions,
     DEFAULT_SEEDS,
     build_sweep_conditions,
+    build_role_action_conditions,
     parse_action_gate_strengths,
+    parse_action_binding_conditions,
+    parse_entity_routing_modes,
     parse_seeds,
 )
 
@@ -52,6 +60,23 @@ def build_parser():
         default=None,
         help="Comma-separated component ablation modes; when set, lambda sweep is disabled.",
     )
+    parser.add_argument(
+        "--role-action-bias-strengths",
+        default=None,
+        help="Comma-separated role-bias strengths; enables matched full-mode role ablation.",
+    )
+    parser.add_argument(
+        "--action-binding-conditions",
+        type=parse_action_binding_conditions,
+        default=None,
+        help="Comma-separated beta:gamma pairs; enables matched full-mode binding ablation.",
+    )
+    parser.add_argument(
+        "--entity-routing-modes",
+        type=parse_entity_routing_modes,
+        default=None,
+        help="Comma-separated off,hard modes; combines with action-binding conditions.",
+    )
     return parser
 
 
@@ -70,7 +95,11 @@ def inference_settings(args):
         "use_interpolate": getattr(args, "use_interpolate", False),
         "consistency_mode": getattr(args, "consistency_mode", None),
         "action_gate_strength": getattr(args, "action_gate_strength", None),
-        "experiment_schema": 3,
+        "role_action_bias_strength": getattr(args, "role_action_bias_strength", 0.0),
+        "action_binding_beta": getattr(args, "action_binding_beta", 0.0),
+        "action_binding_gamma": getattr(args, "action_binding_gamma", 0.0),
+        "entity_routing_mode": getattr(args, "entity_routing_mode", "off"),
+        "experiment_schema": 7,
     }
 
 
@@ -148,11 +177,26 @@ def main() -> int:
     prompt_files = sorted(prompts_dir.rglob("*.txt"))
     if not prompt_files:
         raise RuntimeError(f"No .txt files found in {prompts_dir}")
-    conditions = (
-        build_component_conditions(args.consistency_modes, args.seeds)
-        if args.consistency_modes
-        else build_sweep_conditions(args.action_gate_strengths, args.seeds)
-    )
+    selected = sum(bool(value) for value in (
+        args.consistency_modes,
+        args.role_action_bias_strengths,
+        args.entity_routing_modes or args.action_binding_conditions,
+    ))
+    if selected > 1:
+        raise ValueError("Choose exactly one optional experiment condition family.")
+    if args.entity_routing_modes:
+        binding_conditions = args.action_binding_conditions or [(0.0, 0.0), (1.0, 0.5)]
+        conditions = build_entity_routing_conditions(
+            args.entity_routing_modes, binding_conditions, args.seeds
+        )
+    elif args.action_binding_conditions:
+        conditions = build_action_binding_conditions(args.action_binding_conditions, args.seeds)
+    elif args.role_action_bias_strengths:
+        conditions = build_role_action_conditions(args.role_action_bias_strengths, args.seeds)
+    elif args.consistency_modes:
+        conditions = build_component_conditions(args.consistency_modes, args.seeds)
+    else:
+        conditions = build_sweep_conditions(args.action_gate_strengths, args.seeds)
     total_tasks = len(prompt_files) * len(conditions)
 
     # Import after parsing so this wrapper remains unit-testable without the
@@ -167,6 +211,10 @@ def main() -> int:
         condition.key: {
             "action_gate_strength": getattr(condition, "action_gate_strength", 0.0),
             "consistency_mode": getattr(condition, "consistency_mode", "full"),
+            "role_action_bias_strength": getattr(condition, "role_action_bias_strength", 0.0),
+            "action_binding_beta": getattr(condition, "beta", 0.0),
+            "action_binding_gamma": getattr(condition, "gamma", 0.0),
+            "entity_routing_mode": getattr(condition, "entity_routing_mode", "off"),
             "seed": condition.seed,
             "total": len(prompt_files),
             "generated": 0,
@@ -198,10 +246,42 @@ def main() -> int:
                     run_args.consistency_mode = condition.consistency_mode
                     run_args.use_interpolate = condition.consistency_mode == "full"
                     run_args.action_gate_strength = 0.0
+                    run_args.role_action_bias_strength = 0.0
+                    run_args.action_binding_beta = 0.0
+                    run_args.action_binding_gamma = 0.0
+                    run_args.entity_routing_mode = "off"
+                elif isinstance(condition, RoleActionCondition):
+                    run_args.consistency_mode = "full"
+                    run_args.use_interpolate = True
+                    run_args.action_gate_strength = 0.0
+                    run_args.role_action_bias_strength = condition.role_action_bias_strength
+                    run_args.action_binding_beta = 0.0
+                    run_args.action_binding_gamma = 0.0
+                    run_args.entity_routing_mode = "off"
+                elif isinstance(condition, EntityRoutingCondition):
+                    run_args.consistency_mode = "full"
+                    run_args.use_interpolate = True
+                    run_args.action_gate_strength = 0.0
+                    run_args.role_action_bias_strength = 0.0
+                    run_args.action_binding_beta = condition.beta
+                    run_args.action_binding_gamma = condition.gamma
+                    run_args.entity_routing_mode = condition.entity_routing_mode
+                elif isinstance(condition, ActionBindingCondition):
+                    run_args.consistency_mode = "full"
+                    run_args.use_interpolate = True
+                    run_args.action_gate_strength = 0.0
+                    run_args.role_action_bias_strength = 0.0
+                    run_args.action_binding_beta = condition.beta
+                    run_args.action_binding_gamma = condition.gamma
+                    run_args.entity_routing_mode = "off"
                 else:
                     run_args.consistency_mode = "full"
                     run_args.use_interpolate = True
                     run_args.action_gate_strength = condition.action_gate_strength
+                    run_args.role_action_bias_strength = 0.0
+                    run_args.action_binding_beta = 0.0
+                    run_args.action_binding_gamma = 0.0
+                    run_args.entity_routing_mode = "off"
                 run_args.save_action_maps = True
                 run_args.save_merge_maps = True
                 run_args.share_bg = False
@@ -237,6 +317,7 @@ def main() -> int:
                         "condition": condition.key,
                         "action_gate_strength": getattr(condition, "action_gate_strength", 0.0),
                         "consistency_mode": getattr(condition, "consistency_mode", "full"),
+                        "role_action_bias_strength": getattr(condition, "role_action_bias_strength", 0.0),
                         "seed": condition.seed,
                         "exit_code": 1,
                         "error": f"{type(exc).__name__}: {exc}",
